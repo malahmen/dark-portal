@@ -121,8 +121,11 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/dark-portal"
 CONFIG_DIR="${CONFIG_DIR/#\~/$HOME}"
 CONFIG_FILE="${CONFIG_DIR}/dark-portal.conf"
 INSTANCES_DIR="${CONFIG_DIR}/instances"
+# Per-window claim locks for _title_keeper — see its own comment for why a
+# plain "is it already titled" check isn't enough on its own.
+WINDOW_CLAIMS_DIR="${CONFIG_DIR}/window-claims"
 
-mkdir -p "$CONFIG_DIR" "$INSTANCES_DIR"
+mkdir -p "$CONFIG_DIR" "$INSTANCES_DIR" "$WINDOW_CLAIMS_DIR"
 
 INSTANCE_NAME_RE='^[A-Za-z0-9_-]{1,32}$'
 RESOLUTION_RE='^[0-9]+x[0-9]+$'
@@ -783,34 +786,69 @@ cmd_launch() {
 # "Input", ~1x1-119x34px) alongside its real ~800x600+ one, so among the new
 # windows the largest by area is taken to be the actual game window, not
 # just whichever the diff happens to list first.
+#
+# Found live: launching two instances close together (the normal way to set
+# up a multibox session) races this diff. Instance B's window is "new since
+# instance A's before-snapshot" too, since A's snapshot was taken before B
+# even started — so if B's window loads faster/bigger than A's own window at
+# that instant, A's keeper claims B's window as its own. Both keepers then
+# fight over that one window every ~2s, each renaming it back to their own
+# name, while the *other* real window sits untitled forever. Confirmed live:
+# the same KWin internalId/PID observed labeled two different instance names
+# 15 seconds apart.
+#
+# First fix attempt — skip any candidate whose CURRENT title already matches
+# some *other* instance's name — was insufficient on its own: it only
+# excludes windows a sibling keeper has *already renamed*. Launching two
+# instances truly simultaneously (confirmed live) has both keepers reach the
+# same still-untitled candidate before either has renamed anything, so both
+# pass that check and both commit to it. Fixed for real with a proper mutual
+# exclusion: WINDOW_CLAIMS_DIR/<window id>, created via `mkdir` — atomic on
+# POSIX filesystems, so when two keepers race to claim the same window id at
+# the same instant, exactly one `mkdir` succeeds and the other correctly
+# fails and keeps searching. The title-match check stays too, as a cheap
+# pre-filter that avoids even attempting to claim an obviously-already-named
+# window. The claim is released once this keeper's own loop ends (game
+# closed), so a later launch reusing that window id isn't blocked forever.
 _title_keeper() {
     local name="$1" before="$2" client wid current waited
-    local candidates cand WIDTH HEIGHT area best_area
+    local candidates cand WIDTH HEIGHT area best_area best_cand cand_title other_names
 
     client="$(_instance_client "$name")"
+    other_names="$(_list_instance_names | grep -vxF "$name" || true)"
 
     wid="" waited=0
     while [[ -z "$wid" ]] && (( waited < 30 )) && pgrep -f "${client}/WoW.exe" >/dev/null 2>&1; do
         candidates="$(comm -13 <(printf '%s\n' "$before" | sort -u) <(xdotool search --name "." 2>/dev/null | sort -u))"
-        best_area=0
+        best_area=0 best_cand=""
         while IFS= read -r cand; do
             [[ -z "$cand" ]] && continue
+            [[ -d "${WINDOW_CLAIMS_DIR}/${cand}" ]] && continue
+            cand_title="$(xdotool getwindowname "$cand" 2>/dev/null || true)"
+            [[ -n "$cand_title" ]] && grep -qxF "$cand_title" <<< "$other_names" && continue
             WIDTH="" HEIGHT=""
             eval "$(xdotool getwindowgeometry --shell "$cand" 2>/dev/null | grep -E '^(WIDTH|HEIGHT)=')"
             [[ -z "$WIDTH" || -z "$HEIGHT" ]] && continue
             area=$(( WIDTH * HEIGHT ))
             if (( area > best_area )); then
                 best_area=$area
-                wid="$cand"
+                best_cand="$cand"
             fi
         done <<< "$candidates"
         # A real game window is comfortably larger than the tiny IME/helper
-        # popups — require at least 100x100 before committing, otherwise
-        # keep searching in case the actual window hasn't appeared yet.
-        (( best_area >= 10000 )) || wid=""
-        [[ -n "$wid" ]] || { sleep 1; waited=$((waited + 1)); }
+        # popups — require at least 100x100 before even trying to claim,
+        # otherwise keep searching in case the actual window hasn't
+        # appeared yet. The mkdir is the actual race-proof claim: the size
+        # check above can pass for two keepers on the same candidate in the
+        # same instant, but only one of them wins this.
+        if (( best_area >= 10000 )) && mkdir "${WINDOW_CLAIMS_DIR}/${best_cand}" 2>/dev/null; then
+            wid="$best_cand"
+        else
+            sleep 1; waited=$((waited + 1))
+        fi
     done
     [[ -z "$wid" ]] && return 0
+    trap 'rmdir "${WINDOW_CLAIMS_DIR}/${wid}" 2>/dev/null || true' RETURN
 
     while pgrep -f "${client}/WoW.exe" >/dev/null 2>&1; do
         current="$(xdotool getwindowname "$wid" 2>/dev/null || true)"
