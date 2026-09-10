@@ -792,11 +792,18 @@ cmd_launch() {
     command -v xdotool &>/dev/null && before_windows="$(xdotool search --name "." 2>/dev/null)"
 
     info "Launching '${name}' (windowed ${res}, realm $(_effective_realm "$name"))..."
-    (cd "$client" && nohup flatpak run --command="$(_runner_dir)/bin/wine" \
+    # The pidfile must hold the PID of the 'flatpak' process itself, since
+    # _pid_is_instance proves ownership by looking for the exe path in that
+    # PID's argv. Backgrounding the whole 'cd && nohup ...' list (the earlier
+    # form) makes '&' fork a bash subshell to run the list and hands back
+    # THAT subshell's PID - its argv is this script's own command line, never
+    # the exe - so every launch read as "did not start". The braces confine
+    # '&' to the nohup command alone, whose PID is the real launcher's.
+    (cd "$client" && { nohup flatpak run --command="$(_runner_dir)/bin/wine" \
             --env=WINEPREFIX="$(_bottle_dir "$name")" --env=WINEDEBUG=-all --unset-env=WAYLAND_DISPLAY \
             "$BOTTLES_APP_ID" "$exe" \
         >> "${client}/../wine.log" 2>&1 &
-     echo "$!" > "$pidfile")
+     echo "$!" > "$pidfile"; })
 
     # Flatpak sandbox setup + wineserver spin-up + DXVK's cold-cache shader
     # compile can comfortably take longer than a flat 1s check would allow —
