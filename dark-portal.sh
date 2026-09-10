@@ -856,14 +856,19 @@ cmd_launch() {
 # window. The claim is released once this keeper's own loop ends (game
 # closed), so a later launch reusing that window id isn't blocked forever.
 _title_keeper() {
-    local name="$1" before="$2" client wid current waited
+    local name="$1" before="$2" client exe_re wid current waited
     local candidates cand WIDTH HEIGHT area best_area best_cand cand_title other_names
 
     client="$(_instance_client "$name")"
     other_names="$(_list_instance_names | grep -vxF "$name" || true)"
+    # "Is the game still alive" is the same argv fingerprint 'stop' uses: it
+    # matches either casing of the exe (launch falls back to wow.exe, and a
+    # hard-coded WoW.exe here meant lowercase clients never got titled) and
+    # is regex-escaped/anchored, unlike a raw path in a pgrep -f pattern.
+    exe_re="$(_instance_exe_pattern "$name")"
 
     wid="" waited=0
-    while [[ -z "$wid" ]] && (( waited < 30 )) && pgrep -f "${client}/WoW.exe" >/dev/null 2>&1; do
+    while [[ -z "$wid" ]] && (( waited < 30 )) && pgrep -f "$exe_re" >/dev/null 2>&1; do
         candidates="$(comm -13 <(printf '%s\n' "$before" | sort -u) <(xdotool search --name "." 2>/dev/null | sort -u))"
         best_area=0 best_cand=""
         while IFS= read -r cand; do
@@ -895,7 +900,7 @@ _title_keeper() {
     [[ -z "$wid" ]] && return 0
     trap 'rmdir "${WINDOW_CLAIMS_DIR}/${wid}" 2>/dev/null || true' RETURN
 
-    while pgrep -f "${client}/WoW.exe" >/dev/null 2>&1; do
+    while pgrep -f "$exe_re" >/dev/null 2>&1; do
         current="$(xdotool getwindowname "$wid" 2>/dev/null || true)"
         [[ "$current" == "$name" ]] || xdotool set_window --name "$name" "$wid" 2>/dev/null || true
         sleep 2
