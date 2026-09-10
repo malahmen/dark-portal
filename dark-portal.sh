@@ -168,6 +168,14 @@ cfg_default() { _cfg_default "$CONFIG_FILE" "$1" "$2"; }
 
 _settings() {
     CLIENT_SOURCE_DIR="$(cfg_default CLIENT_SOURCE_DIR "")"
+    # Expand a leading '~' the way CONFIG_DIR is above: the front-end pushes
+    # values through 'set' as literal strings, so "~/games/wow" is stored
+    # with the tilde intact and 'configure'/'add-instance' would otherwise
+    # look for a directory literally named '~'. Only this user's own '~'
+    # (bare, or followed by '/') is expanded - '~user' is left alone rather
+    # than mangled. This is the one path-valued key; the rest are names.
+    # shellcheck disable=SC2088  # the literal tilde is the point here
+    [[ "$CLIENT_SOURCE_DIR" == "~" || "$CLIENT_SOURCE_DIR" == "~/"* ]] && CLIENT_SOURCE_DIR="${HOME}${CLIENT_SOURCE_DIR#\~}"
     CLIENT_ISOLATION_MODE="$(cfg_default CLIENT_ISOLATION_MODE full)"   # full|shared
     WINE_ARCH="$(cfg_default WINE_ARCH win32)"                          # win32|win64
     BOTTLES_RUNNER="$(cfg_default BOTTLES_RUNNER "")"                   # e.g. soda-9.0-1
