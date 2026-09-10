@@ -79,8 +79,12 @@
 #              measurable read latency and client disconnects.
 #   - shared — each instance symlinks CLIENT_SOURCE_DIR's large/static
 #              directories (Data/, Fonts/, Interface/, the .exe, ...) and gets
-#              real, private WTF/Cache/Logs/Errors/Screenshots directories.
-#              Minimal disk cost, fine at low instance counts.
+#              real, private WTF/Cache/Logs/Errors/Screenshots directories,
+#              created EMPTY: the source's WTF/ (its accounts, saved
+#              variables, keybinds) is deliberately not copied, so a shared
+#              instance starts at game defaults plus the window/realm cvars
+#              'launch' renders. Minimal disk cost, fine at low instance
+#              counts.
 #
 # Self-contained: no shared _common lib, no host package manager — Wine runs
 # through the Bottles Flatpak (see below) and the log helpers are inlined.
@@ -89,10 +93,20 @@
 # grants it read-write access to this script's own CONFIG_DIR (instance data
 # lives there) and 'configure' grants read-only access to whatever
 # CLIENT_SOURCE_DIR is pointed at, since that can be anywhere (e.g. an
-# external drive).
+# external drive). Both grants are bound to the path as resolved at the time
+# that command ran: change XDG_CONFIG_HOME (or CLIENT_SOURCE_DIR) later and
+# re-run install-deps (or configure) so the sandbox can reach the new one.
 #
-# Config: ~/.config/dark-portal/dark-portal.conf (global)
-#         ~/.config/dark-portal/instances/<name>/instance.conf (per-instance)
+# Host tools this leans on at runtime, besides bash >= 4 and flatpak: GNU
+# grep/sed (grep -P, sed -i), coreutils timeout, iproute2's ip
+# (discover-realm's subnet), xdotool (title keeper; optional, launch works
+# without it) and nmap (optional, faster discover-realm).
+#
+# Config: ${XDG_CONFIG_HOME:-~/.config}/dark-portal/dark-portal.conf (global)
+#         .../dark-portal/instances/<name>/instance.conf (per-instance)
+#         .../dark-portal/instances/<name>/wine.log (that box's Wine/game
+#         output, appended to on every launch - the first place to look when
+#         a launch "did not seem to start")
 # Bottles' own data (bottles/runners, not managed by this script's config):
 #         ~/.var/app/com.usebottles.bottles/data/bottles/
 # -----------------------------------------------------------------------------
@@ -193,8 +207,10 @@ _runner_dir()  { echo "${BOTTLES_DATA_DIR}/runners/${BOTTLES_RUNNER}"; }
 # _wine_run <instance> <runner-binary> [args...] — runs one Wine-side binary
 # (wine, winecfg, wineserver, ...) against that instance's own bottle, using
 # the configured runner, inside the Bottles sandbox. WAYLAND_DISPLAY is unset
-# to force XWayland — see header note on the virtual-desktop bug in Wine's
-# native Wayland driver.
+# so Wine renders through XWayland: ordinary top-level windows look the same
+# either way, but the title keeper's xdotool can only find and rename X11
+# windows (see header note) - and this keeps every Wine invocation on the
+# same display path as 'launch'.
 _wine_run() {
     local instance="$1" bin="$2"; shift 2
     flatpak run --command="$(_runner_dir)/bin/${bin}" \
@@ -482,7 +498,7 @@ _write_realmlist() {
     client_dir="$(_instance_client "$name")"
     realm="$(_effective_realm "$name")"
     addr="${realm%:*}" port="${realm##*:}"
-    [[ -z "$addr" ]] && { warn "No realm address set for '${name}' (global default is empty too) — set one via 'configure' or 'edit-instance'."; return 1; }
+    [[ -z "$addr" ]] && { warn "No realm address set for '${name}' (global default is empty too) — 'set DEFAULT_REALM_ADDRESS <ip>' (or 'discover-realm --set'), or 'edit-instance --name ${name} --realm <ip>'."; return 1; }
 
     value="$addr"
     [[ "$port" != "3724" ]] && value+=":${port}"
@@ -1021,7 +1037,9 @@ Usage: dark-portal.sh <command> [flags]
 Setup:
   install-deps
   configure                              validate settings + grant Bottles fs access
-  discover-realm [--port P] [--set]      scan the LAN, print candidate realm IPs
+  discover-realm [--port P] [--set]      scan the LAN for an open realm port
+                                         (default 3724), print candidate IPs;
+                                         --set persists a single hit as the default
   winecfg --name N                       open winecfg for one instance's bottle
   list-runners                           available Bottles Wine runners
 
@@ -1032,13 +1050,18 @@ Instances:
   list-instances [--names]               summary, or bare names with --names
 
 Launch:
-  launch --name N
-  stop --name N
+  launch --name N | launch N             (writes instances/N/wine.log)
+  stop --name N | stop N
   stop-all
   status
 
 Config store (used by the scomp-link front-end):
-  set KEY VALUE | get KEY | config
+  set KEY VALUE                          store one global key
+  get KEY                                effective value (config or default)
+  config                                 dump the raw global config file
+
+Config dir: ${XDG_CONFIG_HOME:-~/.config}/dark-portal (Bottles is granted
+  access to it by install-deps - re-run that if XDG_CONFIG_HOME changes).
 
 Config keys: CLIENT_SOURCE_DIR, CLIENT_ISOLATION_MODE (full|shared),
   WINE_ARCH (win32|win64), BOTTLES_RUNNER, DEFAULT_RESOLUTION,
