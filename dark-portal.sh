@@ -478,7 +478,7 @@ _effective_resolution() {
 # effect. Safe to call every launch — same idempotent re-derive-from-config
 # pattern the server script uses for its own conf files.
 _write_realmlist() {
-    local name="$1" client_dir realm addr port value config_wtf
+    local name="$1" client_dir realm addr port value config_wtf rc
     client_dir="$(_instance_client "$name")"
     realm="$(_effective_realm "$name")"
     addr="${realm%:*}" port="${realm##*:}"
@@ -491,8 +491,18 @@ _write_realmlist() {
 
     config_wtf="${client_dir}/WTF/Config.wtf"
     if [[ -f "$config_wtf" ]] && grep -qiE '^SET +realm(List|Name)[[:space:]]' "$config_wtf"; then
-        grep -viE '^SET +realm(List|Name)[[:space:]]' "$config_wtf" > "${config_wtf}.tmp" \
-            && mv "${config_wtf}.tmp" "$config_wtf"
+        # grep -v exits 1 when NOTHING survives the filter (a Config.wtf made
+        # of realm lines only) - a legitimate, empty result, not a failure -
+        # so only exit >= 2 (unreadable file, bad pattern) is an error. With
+        # a plain '&& mv' the exit-1 case skipped the rename and left the
+        # stale cvars in place plus an orphaned .tmp next to them.
+        rc=0
+        grep -viE '^SET +realm(List|Name)[[:space:]]' "$config_wtf" > "${config_wtf}.tmp" || rc=$?
+        if (( rc > 1 )); then
+            rm -f "${config_wtf}.tmp"
+            error_exit "Failed to rewrite ${config_wtf} (grep exited with ${rc})."
+        fi
+        mv "${config_wtf}.tmp" "$config_wtf"
     fi
 }
 
