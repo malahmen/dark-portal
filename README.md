@@ -28,7 +28,10 @@ addon cache never collide.
 - **Two isolation modes** (a per-deployment choice): `full` copies the whole
   client per instance (best at high instance counts — no shared-inode read
   contention); `shared` symlinks the large/static dirs and keeps private
-  `WTF`/`Cache`/… (minimal disk, fine at low counts).
+  `WTF`/`Cache`/… (minimal disk, fine at low counts). A `shared` instance's
+  `WTF/` starts **empty** — the source client's accounts, saved variables and
+  keybinds are deliberately not copied; it begins at game defaults plus the
+  window/realm cvars `launch` renders.
 - **Plain windowed launch** — runs `WoW.exe` directly (no Wine virtual-desktop
   wrapper, which some WMs force-fullscreen), sized via `Config.wtf`'s
   `gxWindow`/`gxResolution`, re-rendered every launch.
@@ -41,11 +44,24 @@ addon cache never collide.
   setting (and stray `SET realmList`/`realmName` cvars in `Config.wtf` are
   stripped), so an `edit-instance`/`set` change is never silently stale.
 - **LAN realm discovery** — a best-effort TCP port probe of the local /24 for an
-  open realm port (default 3724). A port probe, not a full protocol handshake —
-  the result is a prefill you can override.
+  open realm port (default 3724, `--port P` to change). A port probe, not a full
+  protocol handshake — the result is a prefill you can override; `--set`
+  persists it as the default only when exactly one host answers.
+- **Per-instance `wine.log`** — every launch appends the Wine/game output to
+  `instances/<name>/wine.log`; when a launch "did not seem to start", look there.
 
 > **Platform:** Linux + Flatpak/Bottles + X11/XWayland. macOS can drive the
 > config subcommands, but provisioning and launching clients needs Linux.
+
+### Runtime requirements
+
+| Tool | Needed for | Notes |
+| --- | --- | --- |
+| `bash` ≥ 4, `flatpak` | everything | `install-deps` installs Bottles from Flathub |
+| GNU `grep`, GNU `sed` | config/realmlist rewriting, subnet detection | uses `grep -P` and `sed -i` — BSD variants won't do |
+| `timeout` (coreutils), `ip` (iproute2) | `discover-realm` | `ip route` finds the local /24 |
+| `xdotool` | stable window titles (`launch`) | optional — without it windows keep the game's own title |
+| `nmap` | faster `discover-realm` | optional — falls back to a slower pure-bash sweep |
 
 ## Install / usage
 
@@ -73,18 +89,22 @@ Instances
   list-instances [--names]               summary, or bare names with --names
 
 Launch
-  launch --name N
-  stop --name N
+  launch --name N | launch N
+  stop --name N | stop N
   stop-all
   status
 
 Config store
-  set KEY VALUE | get KEY | config
+  set KEY VALUE                          store one global key
+  get KEY                                effective value (config or default)
+  config                                 dump the raw global config file
 ```
 
-`discover-realm` prints candidate IPs to stdout (progress to stderr), so a
-front-end can present them; `--set` persists the address only when the scan
-finds exactly one host.
+`launch` and `stop` accept the instance name either as `--name N` or as a bare
+positional argument. `discover-realm [--port P] [--set]` prints candidate IPs
+to stdout (progress to stderr), so a front-end can present them; `--set`
+persists the address only when the scan finds exactly one host. `get` returns
+the *effective* value (stored or default), `config` dumps the raw file.
 
 ### Examples
 
@@ -106,9 +126,17 @@ finds exactly one host.
 
 ## Configuration
 
-Global state lives in `~/.config/dark-portal/dark-portal.conf`; per-instance
-overrides in `~/.config/dark-portal/instances/<name>/instance.conf`. Read/write
-the global store with `get`/`set`/`config`.
+Global state lives in `$XDG_CONFIG_HOME/dark-portal/dark-portal.conf`
+(`~/.config/dark-portal/` when `XDG_CONFIG_HOME` is unset); per-instance
+overrides in `.../dark-portal/instances/<name>/instance.conf`, alongside that
+instance's `client/` and `wine.log`. Read/write the global store with
+`get`/`set`/`config`.
+
+The Bottles sandbox is granted read-write access to that directory by
+`install-deps`, and read-only access to `CLIENT_SOURCE_DIR` by `configure` —
+each bound to the path **as it resolved when that command ran**. If you later
+change `XDG_CONFIG_HOME` (or `CLIENT_SOURCE_DIR`), re-run `install-deps` (or
+`configure`) so the sandbox can reach the new location.
 
 | Key | Default | Notes |
 | --- | --- | --- |
@@ -121,7 +149,9 @@ the global store with `get`/`set`/`config`.
 | `DEFAULT_REALM_PORT` | `3724` | realm port |
 
 Per-instance overrides (`RESOLUTION`, `REALM_ADDRESS`, `REALM_PORT`) are set via
-`add-instance`/`edit-instance` flags and win over the defaults.
+`add-instance`/`edit-instance` flags and win over the defaults. There is no flag
+to clear one once set — edit or delete the line in that instance's
+`instance.conf` to fall back to the global default.
 
 ## Credits
 
