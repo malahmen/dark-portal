@@ -57,7 +57,13 @@
 #     before starting the process, and the title keeper diffs against that
 #     to find the one new window this launch created, then re-asserts its
 #     title to the instance name every couple seconds for as long as the game
-#     process is alive, then exits on its own. This needs xdotool and an
+#     process is alive, then exits on its own. Launches are serialized through
+#     a lock (CONFIG_DIR/launch.lock) that 'launch' holds from that snapshot
+#     until its window has been claimed (or the ~30s search gave up), so two
+#     boxes started back-to-back can't have their windows cross-assigned;
+#     each claim (CONFIG_DIR/window-claims/<id>) records its keeper's PID, so
+#     one left behind by a killed keeper is recognised as stale instead of
+#     blocking that window id forever. This needs xdotool and an
 #     X11/XWayland-reachable session (WAYLAND_DISPLAY is still unset for
 #     every Wine invocation to guarantee that, even though ordinary top-level
 #     windows render fine either way — only xdotool/wmctrl's ability to find
@@ -121,9 +127,12 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/dark-portal"
 CONFIG_DIR="${CONFIG_DIR/#\~/$HOME}"
 CONFIG_FILE="${CONFIG_DIR}/dark-portal.conf"
 INSTANCES_DIR="${CONFIG_DIR}/instances"
-# Per-window claim locks for _title_keeper — see its own comment for why a
-# plain "is it already titled" check isn't enough on its own.
+# Per-window claim locks for the title keeper (each holds an 'owner' file
+# with the keeper's PID) and the launch lock that serializes the
+# snapshot-to-claim phase across launches — see _title_find_window's comment
+# for why a plain "is it already titled" check isn't enough on its own.
 WINDOW_CLAIMS_DIR="${CONFIG_DIR}/window-claims"
+LAUNCH_LOCK_DIR="${CONFIG_DIR}/launch.lock"
 
 mkdir -p "$CONFIG_DIR" "$INSTANCES_DIR" "$WINDOW_CLAIMS_DIR"
 
@@ -765,7 +774,7 @@ cmd_launch() {
     _write_realmlist "$name" || return 1
     _write_window_config "$name"
 
-    local client pidfile res exe
+    local client pidfile res exe wid
     client="$(_instance_client "$name")"
     pidfile="$(_instance_pidfile "$name")"
     res="$(_effective_resolution "$name")"
@@ -779,17 +788,29 @@ cmd_launch() {
     # auto-fullscreen regardless of the requested size; a plain window
     # doesn't trip that and stays normally tileable/resizable.
     #
-    # Snapshot existing windows *before* launching so _title_keeper can find
-    # the new one this instance creates by diffing, rather than by PID or
-    # WM_CLASS — Bottles' bundled runner has been observed reporting a bogus
-    # _NET_WM_PID (likely a Flatpak-sandbox PID-namespace artifact: the
+    # Snapshot existing windows *before* launching so _title_find_window can
+    # find the new one this instance creates by diffing, rather than by PID
+    # or WM_CLASS — Bottles' bundled runner has been observed reporting a
+    # bogus _NET_WM_PID (likely a Flatpak-sandbox PID-namespace artifact: the
     # in-sandbox PID, not the host one) and a generic WM_CLASS shared by every
     # instance using the same runner (it's Proton-derived), so neither can
     # tell two simultaneously running instances apart. A window that didn't
     # exist a moment ago and now does, right as this instance started, can
-    # only be this instance's.
-    local before_windows=""
-    command -v xdotool &>/dev/null && before_windows="$(xdotool search --name "." 2>/dev/null)"
+    # only be this instance's — provided no sibling launch is between *its*
+    # snapshot and its claim at the same time, which is what the launch lock
+    # guarantees: taken here, before the snapshot, and released below once
+    # this launch's window has been claimed (or the search gave up), so the
+    # next launch's snapshot already contains this one's window. While no
+    # instance is running, any leftover window claim is by definition stale
+    # (see _reap_window_claims) — checked under the lock, so a sibling that
+    # has only just claimed can't be mistaken for "nothing running".
+    local before_windows="" have_xdotool=0
+    if command -v xdotool &>/dev/null; then
+        have_xdotool=1
+        _launch_lock_acquire
+        _any_instance_running || _reap_window_claims --all
+        before_windows="$(xdotool search --name "." 2>/dev/null)"
+    fi
 
     info "Launching '${name}' (windowed ${res}, realm $(_effective_realm "$name"))..."
     (cd "$client" && nohup flatpak run --command="$(_runner_dir)/bin/wine" \
@@ -806,20 +827,106 @@ cmd_launch() {
         sleep 1; waited=$((waited + 1))
     done
     if _instance_running "$name"; then
-        if command -v xdotool &>/dev/null; then
-            _title_keeper "$name" "$before_windows" >/dev/null 2>&1 &
-            disown
-            info "Window title will switch to '${name}' within a few seconds."
+        if (( have_xdotool )); then
+            # Find-and-claim runs right here in the foreground, still under
+            # the launch lock, so this very process — the PID the lock
+            # records, whose lifetime bounds the search — is the only one
+            # hunting for a new window right now. Only the long-lived title
+            # loop goes to the background, and its PID lands in the claim
+            # before the lock is released, so no later finder can ever see a
+            # claim without an owner to test for liveness.
+            wid="$(_title_find_window "$name" "$before_windows" 2>/dev/null || true)"
+            if [[ -n "$wid" ]]; then
+                _title_keeper "$name" "$wid" >/dev/null 2>&1 &
+                echo "$!" > "${WINDOW_CLAIMS_DIR}/${wid}/owner"
+                disown
+                info "Window found — its title is being held at '${name}'."
+            else
+                warn "No new window turned up for '${name}' within 30s — its title will be whatever the game sets."
+            fi
+            _launch_lock_release
         fi
         success "'${name}' launched."
     else
+        (( have_xdotool )) && _launch_lock_release
         warn "'${name}' did not seem to start — check $(_instance_dir "$name")/wine.log"
     fi
 }
 
-# _title_keeper <name> <before-windows> — runs in the background for as long
-# as the instance's WoW.exe process is alive, re-asserting its window title
-# to the instance name every couple seconds. See header/launch notes on why:
+# _any_instance_running — true if any instance's pidfile points at a live
+# process that is really that instance's launcher.
+_any_instance_running() {
+    local n
+    while IFS= read -r n; do
+        [[ -n "$n" ]] && _instance_running "$n" && return 0
+    done < <(_list_instance_names)
+    return 1
+}
+
+# _reap_window_claims [--all] — removes window claims whose recorded keeper
+# PID is dead (a keeper killed mid-game leaves its claim behind, and X
+# reuses window ids, so that would silently block a later launch's real
+# window). With --all every claim goes — used when no instance is running,
+# when no keeper can legitimately hold one. A claim with no 'owner' file yet
+# is one whose launch is between mkdir and forking its keeper this very
+# instant (both happen under the launch lock) and is left alone unless --all.
+_reap_window_claims() {
+    local all=0 claim owner
+    [[ "${1:-}" == "--all" ]] && all=1
+    for claim in "$WINDOW_CLAIMS_DIR"/*/; do
+        [[ -d "$claim" ]] || continue
+        owner="$(cat "${claim}owner" 2>/dev/null || true)"
+        if (( all )) || { [[ -n "$owner" ]] && ! kill -0 "$owner" 2>/dev/null; }; then
+            rm -rf "$claim"
+        fi
+    done
+}
+
+# _launch_lock_acquire — takes LAUNCH_LOCK_DIR (mkdir: atomic), first waiting
+# for a sibling launch to finish its snapshot-to-claim phase. The holder's
+# PID lives in 'owner'; a dead owner (a launch killed or Ctrl-C'd mid-search)
+# is a stale lock and is broken at once. A live holder's phase is bounded to
+# ~10s of start-up polling plus ~30s of window hunting, so waiting well past
+# that and then breaking the lock only ever fires on something wedged, never
+# on a healthy neighbour. Breaking renames the lock dir away first (mv:
+# atomic), so of two waiters that both saw the same stale lock only one gets
+# to remove it — the other's rm can't land on a fresh lock that a third
+# launch took in between.
+_launch_lock_acquire() {
+    local waited=0 owner
+    until mkdir "$LAUNCH_LOCK_DIR" 2>/dev/null; do
+        owner="$(cat "${LAUNCH_LOCK_DIR}/owner" 2>/dev/null || true)"
+        if [[ -n "$owner" ]] && ! kill -0 "$owner" 2>/dev/null; then
+            warn "Breaking stale launch lock (owner pid ${owner} is gone)."
+            _launch_lock_break; continue
+        fi
+        if (( waited >= 90 )); then
+            warn "Launch lock held for over 90s by pid '${owner}' — breaking it."
+            _launch_lock_break; continue
+        fi
+        (( waited == 0 )) && info "Waiting for a previous launch to claim its window first..."
+        sleep 1; waited=$((waited + 1))
+    done
+    echo "$BASHPID" > "${LAUNCH_LOCK_DIR}/owner"
+}
+
+_launch_lock_break() {
+    local gone="${LAUNCH_LOCK_DIR}.stale.${BASHPID}"
+    mv "$LAUNCH_LOCK_DIR" "$gone" 2>/dev/null && rm -rf "$gone"
+    return 0
+}
+
+# _launch_lock_release — drops the launch lock, but only if it's still this
+# process's: after a stale-break a different launch may be holding it by now.
+_launch_lock_release() {
+    [[ "$(cat "${LAUNCH_LOCK_DIR}/owner" 2>/dev/null || true)" == "$BASHPID" ]] && rm -rf "$LAUNCH_LOCK_DIR"
+    return 0
+}
+
+# _title_find_window <name> <before-windows> — the find-and-claim half of the
+# title keeper. Runs in the FOREGROUND of 'launch', under the launch lock,
+# for up to ~30s while the game process is alive, and echoes the window id
+# it claimed (nothing if it gave up). See header/launch notes on why:
 # dropping the virtual desktop wrapper (to avoid the WM auto-fullscreen
 # issue) lost its built-in title-naming, the game's own title changes at
 # runtime on its own (login vs character select vs in-world) so a one-shot
@@ -847,20 +954,36 @@ cmd_launch() {
 # excludes windows a sibling keeper has *already renamed*. Launching two
 # instances truly simultaneously (confirmed live) has both keepers reach the
 # same still-untitled candidate before either has renamed anything, so both
-# pass that check and both commit to it. Fixed for real with a proper mutual
+# pass that check and both commit to it. Second fix, a proper mutual
 # exclusion: WINDOW_CLAIMS_DIR/<window id>, created via `mkdir` — atomic on
 # POSIX filesystems, so when two keepers race to claim the same window id at
 # the same instant, exactly one `mkdir` succeeds and the other correctly
 # fails and keeps searching. The title-match check stays too, as a cheap
 # pre-filter that avoids even attempting to claim an obviously-already-named
-# window. The claim is released once this keeper's own loop ends (game
-# closed), so a later launch reusing that window id isn't blocked forever.
-_title_keeper() {
-    local name="$1" before="$2" client wid current waited
+# window.
+#
+# That claim stopped two keepers fighting over one window, but not the
+# swap: when B's window appears before A's, A's keeper (whose snapshot
+# predates B entirely) legitimately claims B's window as "new", and B's
+# keeper then gets A's — titles permanently crossed, exactly what the TUI's
+# multi-select launch loop produces. Closed by running this whole phase
+# under the launch lock 'launch' takes before its snapshot and releases once
+# this has returned: no sibling can be snapshotting or searching while this
+# launch's window is still unaccounted for, so "new since my snapshot"
+# really does mean mine. (The mkdir claim stays — it's what turns a
+# stale-broken lock into merely a slow launch rather than a wrong title.)
+# And since a keeper can be killed mid-game and X reuses window ids, each
+# claim records its keeper's PID in 'owner' ('launch' writes it right after
+# forking _title_keeper, still under the lock); a claim whose owner is dead
+# is stale and gets swept (_reap_window_claims) rather than blocking that
+# window id until the next reboot.
+_title_find_window() {
+    local name="$1" before="$2" client wid waited
     local candidates cand WIDTH HEIGHT area best_area best_cand cand_title other_names
 
     client="$(_instance_client "$name")"
     other_names="$(_list_instance_names | grep -vxF "$name" || true)"
+    _reap_window_claims
 
     wid="" waited=0
     while [[ -z "$wid" ]] && (( waited < 30 )) && pgrep -f "${client}/WoW.exe" >/dev/null 2>&1; do
@@ -892,8 +1015,19 @@ _title_keeper() {
             sleep 1; waited=$((waited + 1))
         fi
     done
-    [[ -z "$wid" ]] && return 0
-    trap 'rmdir "${WINDOW_CLAIMS_DIR}/${wid}" 2>/dev/null || true' RETURN
+    [[ -n "$wid" ]] && echo "$wid"
+    return 0
+}
+
+# _title_keeper <name> <window-id> — the background half: for as long as the
+# instance's WoW.exe process is alive, re-asserts the claimed window's title
+# to the instance name every couple seconds, then drops the claim and exits
+# on its own. Killed instead, it leaves a claim whose recorded owner is dead
+# — which is exactly what _reap_window_claims sweeps.
+_title_keeper() {
+    local name="$1" wid="$2" client current
+    client="$(_instance_client "$name")"
+    trap 'rm -rf "${WINDOW_CLAIMS_DIR}/${wid}" 2>/dev/null || true' RETURN
 
     while pgrep -f "${client}/WoW.exe" >/dev/null 2>&1; do
         current="$(xdotool getwindowname "$wid" 2>/dev/null || true)"
@@ -968,6 +1102,9 @@ cmd_stop_all() {
         [[ -z "$name" ]] && continue
         _instance_running "$name" && _stop_instance_by_name "$name"
     done <<< "$names"
+    # Keepers exit on their own once their game is gone and release their
+    # claims; anything still there now belonged to a keeper that was killed.
+    _any_instance_running || _reap_window_claims --all
 }
 
 # -----------------------------------------------------------------------------
