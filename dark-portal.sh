@@ -398,9 +398,44 @@ _list_instance_names() {
     done | sort
 }
 
+# _pid_is_instance <name> <pid> — true only if <pid> is alive AND its argv
+# references this instance's own client exe. A pidfile alone isn't proof:
+# after a reboot (or a crash that left the file behind) the recorded PID can
+# be reused by anything, which would make 'launch' refuse to start and 'stop'
+# SIGTERM a stranger. The launcher's argv carries the full exe path (see
+# cmd_launch), so that's the fingerprint checked here. /proc is preferred;
+# ps is the fallback for hosts without it.
+_pid_is_instance() {
+    local name="$1" pid="$2" client argv
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    client="$(_instance_client "$name")"
+    if [[ -r "/proc/${pid}/cmdline" ]]; then
+        argv="$(tr '\0' ' ' < "/proc/${pid}/cmdline")"
+    else
+        argv="$(ps -ww -o args= -p "$pid" 2>/dev/null || true)"
+    fi
+    [[ "$argv" == *"${client}/WoW.exe"* || "$argv" == *"${client}/wow.exe"* ]]
+}
+
 _instance_running() {
     local name="$1" pf; pf="$(_instance_pidfile "$name")"
-    [[ -f "$pf" ]] && kill -0 "$(cat "$pf")" 2>/dev/null
+    [[ -f "$pf" ]] || return 1
+    _pid_is_instance "$name" "$(cat "$pf")"
+}
+
+# _regex_escape <string> — escapes ERE metacharacters so a literal path can
+# be embedded in a pkill -f / grep -E pattern without '.' or '+' in a
+# directory name widening the match.
+_regex_escape() { printf '%s' "$1" | sed -e 's/[][\.*^$(){}?+|]/\\&/g'; }
+
+# _instance_exe_pattern <name> — ERE matching an argv that invokes THIS
+# instance's exe (either casing the client ships), and nothing else: the
+# path is anchored to the exe name and to an argument boundary, so a shell
+# that merely cd'd into the client dir, or an editor with a file open under
+# it, doesn't match.
+_instance_exe_pattern() {
+    printf '%s/(WoW|wow)\.exe( |$)' "$(_regex_escape "$(_instance_client "$1")")"
 }
 
 # _effective_realm <name> — echoes "address:port" for this instance: its own
@@ -858,28 +893,37 @@ _title_keeper() {
 }
 
 _stop_instance_by_name() {
-    local name="$1" pidfile
+    local name="$1" pidfile pid
     pidfile="$(_instance_pidfile "$name")"
 
     if [[ ! -f "$pidfile" ]]; then
         info "'${name}' not running."
         return 0
     fi
+    pid="$(cat "$pidfile")"
 
     # wineserver -k tears down every process tied to this bottle (explorer,
     # the game, any helper processes it spawned) — more reliable than killing
     # just the tracked launcher pid, since Wine's process tree is several
     # levels deep and each bottle's wineserver instance is independent of the
-    # others, so this can never affect a different instance. In practice it's
-    # not always synchronous/complete (observed leaving the outer wine/
-    # explorer wrapper alive after the game process itself exited) — a
-    # pkill on this instance's own client path is a reliable fallback, since
-    # that path is unique per instance and shows up verbatim in the whole
-    # process chain's argv (wine/explorer/WoW.exe all reference it directly).
+    # others, so it can't affect a different instance. In practice it's not
+    # always synchronous/complete (observed leaving the outer wine/explorer
+    # wrapper alive after the game process itself exited) — a pkill on this
+    # instance's own exe invocation is the fallback, since that path is
+    # unique per instance and shows up verbatim in the whole process chain's
+    # argv (wine/explorer/WoW.exe all reference it directly). The pattern is
+    # anchored to '<client>/WoW.exe' as a whole argument (not the bare client
+    # dir) so a shell or editor that merely mentions the directory survives,
+    # and the pidfile PID is only signalled once its argv proves it's still
+    # ours — a stale file from before a reboot may point at anything.
     _wine_run "$name" wineserver -k 2>/dev/null || true
-    kill "$(cat "$pidfile")" 2>/dev/null || true
+    if _pid_is_instance "$name" "$pid"; then
+        kill "$pid" 2>/dev/null || true
+    else
+        info "Stale pid file for '${name}' (pid ${pid} is gone or not ours) — skipping it."
+    fi
     sleep 1
-    pkill -9 -f "$(_instance_client "$name")" 2>/dev/null || true
+    pkill -9 -f "$(_instance_exe_pattern "$name")" 2>/dev/null || true
     rm -f "$pidfile"
     success "'${name}' stopped."
 }
