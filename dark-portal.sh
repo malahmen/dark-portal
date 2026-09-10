@@ -1007,9 +1007,6 @@ _launch_lock_release() {
 # pre-filter that avoids even attempting to claim an obviously-already-named
 # window. The claim is released once this keeper's own loop ends (game
 # closed), so a later launch reusing that window id isn't blocked forever.
-_title_keeper() {
-    local name="$1" before="$2" client exe_re wid current waited
-
 # window.
 #
 # That claim stopped two keepers fighting over one window, but not the
@@ -1082,8 +1079,8 @@ _title_find_window() {
 # on its own. Killed instead, it leaves a claim whose recorded owner is dead
 # — which is exactly what _reap_window_claims sweeps.
 _title_keeper() {
-    local name="$1" wid="$2" client current
-    client="$(_instance_client "$name")"
+    local name="$1" wid="$2" exe_re current
+    exe_re="$(_instance_exe_pattern "$name")"
     trap 'rm -rf "${WINDOW_CLAIMS_DIR}/${wid}" 2>/dev/null || true' RETURN
 
     while pgrep -f "$exe_re" >/dev/null 2>&1; do
