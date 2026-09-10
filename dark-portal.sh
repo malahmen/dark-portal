@@ -386,6 +386,17 @@ _instance_conf()   { echo "$(_instance_dir "$1")/instance.conf"; }
 _instance_client() { echo "$(_instance_dir "$1")/client"; }
 _instance_pidfile(){ echo "$(_instance_dir "$1")/instance.pid"; }
 
+# _require_valid_name <cmd> <name> — the single gate every subcommand that
+# takes an instance name goes through before the name is spliced into a
+# path. INSTANCE_NAME_RE has no '.' or '/', so '..' or 'a/../b' can never
+# reach the rm -rf / pkill in remove-instance and stop, and a typo can't
+# silently resolve to a sibling instance's directory.
+_require_valid_name() {
+    local cmd="$1" name="$2"
+    [[ -n "$name" ]] || error_exit "${cmd}: --name is required."
+    [[ "$name" =~ $INSTANCE_NAME_RE ]] || error_exit "${cmd}: invalid name '${name}' — only letters, digits, '-' and '_' allowed (max 32 chars)."
+}
+
 # Instance names (sorted). A plain glob rather than `find -printf` — portable,
 # and safe under `set -o pipefail` (an empty/missing dir yields no output and a
 # clean exit, instead of a find failure aborting the caller's assignment).
@@ -533,8 +544,7 @@ cmd_add_instance() {
         *) error_exit "add-instance: unknown flag: $1" ;;
     esac; done
 
-    [[ -n "$name" ]] || error_exit "add-instance: --name is required."
-    [[ "$name" =~ $INSTANCE_NAME_RE ]] || error_exit "Invalid name '${name}' — only letters, digits, '-' and '_' allowed (max 32 chars)."
+    _require_valid_name add-instance "$name"
     [[ -d "$(_instance_dir "$name")" ]] && error_exit "Instance '${name}' already exists."
 
     local dir client bottle
@@ -652,7 +662,7 @@ cmd_edit_instance() {
         *) error_exit "edit-instance: unknown flag: $1" ;;
     esac; done
 
-    [[ -n "$name" ]] || error_exit "edit-instance: --name is required."
+    _require_valid_name edit-instance "$name"
     [[ -d "$(_instance_dir "$name")" ]] || error_exit "No such instance: ${name}"
 
     local iconf; iconf="$(_instance_conf "$name")"
@@ -693,7 +703,7 @@ cmd_remove_instance() {
         --name) name="$2"; shift 2 ;;
         *) error_exit "remove-instance: unknown flag: $1" ;;
     esac; done
-    [[ -n "$name" ]] || error_exit "remove-instance: --name is required."
+    _require_valid_name remove-instance "$name"
     [[ -d "$(_instance_dir "$name")" ]] || error_exit "No such instance: ${name}"
 
     if _instance_running "$name"; then
@@ -719,7 +729,7 @@ cmd_winecfg() {
         --name) name="$2"; shift 2 ;;
         *) error_exit "winecfg: unknown flag: $1" ;;
     esac; done
-    [[ -n "$name" ]] || error_exit "winecfg: --name is required."
+    _require_valid_name winecfg "$name"
     [[ -d "$(_instance_dir "$name")" ]] || error_exit "No such instance: ${name}"
 
     _wine_run "$name" winecfg
@@ -740,7 +750,7 @@ cmd_launch() {
         -*) error_exit "launch: unknown flag: $1" ;;
         *) name="$1"; shift ;;
     esac; done
-    [[ -n "$name" ]] || error_exit "launch: --name is required."
+    _require_valid_name launch "$name"
     [[ -d "$(_instance_dir "$name")" ]] || error_exit "No such instance: ${name}"
 
     if _instance_running "$name"; then
@@ -939,7 +949,7 @@ cmd_stop() {
         -*) error_exit "stop: unknown flag: $1" ;;
         *) name="$1"; shift ;;
     esac; done
-    [[ -n "$name" ]] || error_exit "stop: --name is required."
+    _require_valid_name stop "$name"
     [[ -d "$(_instance_dir "$name")" ]] || error_exit "No such instance: ${name}"
 
     _stop_instance_by_name "$name"
