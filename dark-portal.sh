@@ -751,7 +751,11 @@ cmd_winecfg() {
     _require_valid_name winecfg "$name"
     [[ -d "$(_instance_dir "$name")" ]] || error_exit "No such instance: ${name}"
 
-    _wine_run "$name" winecfg
+    # 'wine winecfg' rather than exec'ing <runner>/bin/winecfg: winecfg is a
+    # builtin program of Wine itself, always reachable that way, whereas the
+    # bin/winecfg shell wrapper is optional and Soda/Proton-derived runners
+    # (what Bottles ships) don't necessarily include it.
+    _wine_run "$name" wine winecfg
 }
 
 # -----------------------------------------------------------------------------
