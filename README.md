@@ -170,4 +170,4 @@ it configures, isolates, and launches; the game is theirs.
 
 ## License
 
-[The Unlicense](LICENSE) — public domain.
+[MIT](LICENSE) © 2026 malahmen.
