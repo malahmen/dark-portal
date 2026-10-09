@@ -41,8 +41,16 @@ addon cache never collide.
   the instance name, so a key broadcaster can target boxes reliably. Needs
   `xdotool` and an X11/XWayland session.
 - **`realmlist.wtf` is re-derived every launch** from the effective realm
-  setting (and stray `SET realmList`/`realmName` cvars in `Config.wtf` are
-  stripped), so an `edit-instance`/`set` change is never silently stale.
+  setting, so an `edit-instance`/`set` change is never silently stale. A stray
+  `SET realmList` in `Config.wtf` is stripped, because it holds an **address**
+  and takes priority over `realmlist.wtf` entirely.
+  `SET realmName` is deliberately **left alone**: it holds only the name of the
+  realm you last picked, carries no address, and cannot override anything.
+  Stripping it too meant the client forgot your selection on every launch and
+  showed the realm picker every time — the client writes both cvars back on
+  exit, this stripped both on the next start, and round it went. A stale name
+  is harmless: if it no longer matches a realm in the list, the client shows
+  the picker, which is the right fallback.
 - **LAN realm discovery** — a best-effort TCP port probe of the local /24 for an
   open realm port (default 3724, `--port P` to change). A port probe, not a full
   protocol handshake — the result is a prefill you can override; `--set`
