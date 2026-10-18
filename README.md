@@ -161,6 +161,35 @@ Per-instance overrides (`RESOLUTION`, `REALM_ADDRESS`, `REALM_PORT`) are set via
 to clear one once set — edit or delete the line in that instance's
 `instance.conf` to fall back to the global default.
 
+Values are checked on the way in: a realm port is a number from 1 to 65535, a
+realm address a hostname or IP address, a key letters, digits and `_`, and no
+value may hold a newline. A relative `CLIENT_SOURCE_DIR` is stored as an
+absolute path (one already stored relative, by hand, is refused by
+`configure` and `add-instance`).
+
+## Behaviour worth knowing
+
+- `launch` exits non-zero when the game did not start, and holds a
+  per-instance lock (`instances/<name>/launch.lock`), so two launches of the
+  same box at once start one client. With no reachable X display it still
+  launches, without the held window title.
+- `stop` and `remove-instance` stop a game by its exe path even when its
+  pidfile is missing or stale, and `remove-instance` refuses to delete an
+  instance whose game is still running.
+- A failed `add-instance` removes what it made, so it can be retried.
+
+## Testing
+
+```sh
+tests/test-engine.sh
+```
+
+No network, no Bottles, no display: `tests/stubs/` shadows `flatpak` and
+`xdotool`, `HOME` and `XDG_CONFIG_HOME` live under a temporary directory, and
+the "game" is a script named `WoW.exe`. CI
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs it and
+`shellcheck` on every push and pull request.
+
 ## Credits
 
 The client is Blizzard's; the emulation ecosystem it connects to is

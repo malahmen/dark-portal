@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Stand-in for xdotool, so no test reaches a real display.
+#
+#   STUB_X=nodisplay (default)  every call fails, as with no X display
+#   STUB_X=display              one window, 4242 (800x600), appears after the
+#                               first 'search' - the launch's snapshot - so the
+#                               title keeper finds it at once
+#   STUB_X_STATE=<file>         where 'display' counts its searches
+mode="${STUB_X:-nodisplay}"
+[[ "$mode" == display ]] || exit 1
+case "$1" in
+    getdisplaygeometry) echo "1920 1080" ;;
+    search)
+        n="$(cat "$STUB_X_STATE" 2>/dev/null || echo 0)"
+        echo $((n + 1)) > "$STUB_X_STATE"
+        (( n > 0 )) && echo 4242 ;;
+    getwindowgeometry) printf 'WINDOW=4242\nX=0\nY=0\nWIDTH=800\nHEIGHT=600\nSCREEN=0\n' ;;
+    getwindowname) echo "World of Warcraft" ;;
+    set_window) ;;
+esac
+exit 0
