@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Stand-in for flatpak: no sandbox, no Bottles, no Wine. Answers what
+# dark-portal.sh asks of it, and runs the "game" (the exe path it is handed,
+# a test script) directly, so pgrep/pkill see the same argv they see live.
+#
+#   STUB_BOTTLE_FAIL=1   'bottles-cli new' fails
+#   STUB_WINE_FAIL=1     'wine <exe>' exits at once instead of running it
+case "$1" in
+    info|override|install) exit 0 ;;
+    run) shift ;;
+    *) exit 0 ;;
+esac
+cmd=""
+while [[ $# -gt 0 ]]; do case "$1" in
+    --command=*) cmd="${1#--command=}"; shift ;;
+    --env=*|--unset-env=*) shift ;;
+    com.usebottles.bottles) shift; break ;;
+    *) shift ;;
+esac; done
+case "$cmd" in
+    bottles-cli)
+        case "${1:-}" in
+            list) printf 'Found 1 runners:\n- soda-test\nFound 0 dxvk:\n' ;;
+            new)
+                [[ "${STUB_BOTTLE_FAIL:-0}" == 1 ]] && exit 1
+                while [[ $# -gt 0 ]]; do
+                    [[ "$1" == --bottle-name ]] && mkdir -p "$HOME/.var/app/com.usebottles.bottles/data/bottles/bottles/$2"
+                    shift
+                done ;;
+        esac
+        exit 0 ;;
+    */bin/wineserver) exit 0 ;;
+    */bin/wine)
+        [[ "${STUB_WINE_FAIL:-0}" == 1 ]] && exit 1
+        exec "$@" ;;
+esac
+exit 0

@@ -152,6 +152,15 @@ mkdir -p "$CONFIG_DIR" "$INSTANCES_DIR" "$WINDOW_CLAIMS_DIR"
 
 INSTANCE_NAME_RE='^[A-Za-z0-9_-]{1,32}$'
 RESOLUTION_RE='^[0-9]+x[0-9]+$'
+# A realm address is a hostname or an IPv4 address, nothing else: it is
+# written into realmlist.wtf, where a newline would add client cvars.
+REALM_ADDRESS_RE='^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$'
+# The config store's keys: spliced into a grep pattern, so letters, digits
+# and '_' only.
+CFG_KEY_RE='^[A-Z_][A-Z0-9_]*$'
+# The global settings _settings resolves, which 'get' answers from.
+SETTING_KEYS=(CLIENT_SOURCE_DIR CLIENT_ISOLATION_MODE WINE_ARCH BOTTLES_RUNNER
+              DEFAULT_RESOLUTION DEFAULT_REALM_ADDRESS DEFAULT_REALM_PORT)
 
 BOTTLES_APP_ID="com.usebottles.bottles"
 BOTTLES_DATA_DIR="${HOME}/.var/app/${BOTTLES_APP_ID}/data/bottles"
@@ -163,10 +172,16 @@ BOTTLES_DATA_DIR="${HOME}/.var/app/${BOTTLES_APP_ID}/data/bottles"
 
 _cfg_get() {
     local file="$1" key="$2"
+    [[ "$key" =~ $CFG_KEY_RE ]] || error_exit "invalid config key '${key}' (A-Z, 0-9 and '_')."
     grep -E "^${key}=" "$file" 2>/dev/null | cut -d= -f2- | sed 's/^"\(.*\)"$/\1/' || true
 }
 _cfg_set() {
     local file="$1" key="$2" val="$3" tmp
+    # The key goes into a grep pattern below: 'set B.* x' matched, and
+    # deleted, BOTTLES_RUNNER. A newline in the value would add lines of its
+    # own to the file.
+    [[ "$key" =~ $CFG_KEY_RE ]] || error_exit "invalid config key '${key}' (A-Z, 0-9 and '_')."
+    [[ "$val" != *$'\n'* ]] || error_exit "${key}: the value must not contain a newline."
     touch "$file"
     # Rewrite without sed so value metacharacters (| & \) can't corrupt the line:
     # drop any existing entry for this key, then append the new KEY="value".
@@ -181,9 +196,32 @@ _cfg_default() {
     echo "${val:-$default}"
 }
 
+# _require_client_source — CLIENT_SOURCE_DIR is absolute. Relative, every
+# command resolved it against its own cwd: shared mode's symlinks pointed
+# nowhere, full mode's cp -a copied whatever was there, and the Bottles grant
+# named a path the sandbox could not use.
+_require_client_source() {
+    [[ "$CLIENT_SOURCE_DIR" == /* ]] \
+        || error_exit "CLIENT_SOURCE_DIR must be an absolute path (got '${CLIENT_SOURCE_DIR}') — 'set CLIENT_SOURCE_DIR /full/path/to/client'."
+}
+
 cfg_get()     { _cfg_get "$CONFIG_FILE" "$1"; }
 cfg_set()     { _cfg_set "$CONFIG_FILE" "$1" "$2"; }
 cfg_default() { _cfg_default "$CONFIG_FILE" "$1" "$2"; }
+
+# _require_port <what> <value> — a TCP port, 1-65535. A port reaches a bash -c
+# string in discover-realm's scan and realmlist.wtf in launch, so it is a
+# number or it is refused: '--port "1; touch X; :"' ran touch 64 times.
+_require_port() {
+    [[ "$2" =~ ^[0-9]{1,5}$ ]] && (( 10#$2 >= 1 && 10#$2 <= 65535 )) \
+        || error_exit "$1: port must be a number from 1 to 65535 (got '$2')."
+}
+
+# _require_realm_address <what> <value>
+_require_realm_address() {
+    [[ "$2" =~ $REALM_ADDRESS_RE ]] \
+        || error_exit "$1: realm address must be a hostname or IP address (got '$2')."
+}
 
 # -----------------------------------------------------------------------------
 # Resolved settings (read fresh each invocation)
@@ -199,6 +237,9 @@ _settings() {
     # than mangled. This is the one path-valued key; the rest are names.
     # shellcheck disable=SC2088  # the literal tilde is the point here
     [[ "$CLIENT_SOURCE_DIR" == "~" || "$CLIENT_SOURCE_DIR" == "~/"* ]] && CLIENT_SOURCE_DIR="${HOME}${CLIENT_SOURCE_DIR#\~}"
+    # Still relative here means a config written before 'set' stored it
+    # absolute, or edited by hand. Nothing resolves it the same way twice, so
+    # the commands that use it refuse it (_require_client_source).
     CLIENT_ISOLATION_MODE="$(cfg_default CLIENT_ISOLATION_MODE full)"   # full|shared
     WINE_ARCH="$(cfg_default WINE_ARCH win32)"                          # win32|win64
     BOTTLES_RUNNER="$(cfg_default BOTTLES_RUNNER "")"                   # e.g. soda-9.0-1
@@ -322,14 +363,21 @@ _local_subnet_base() {
 # _scan_lan_for_port <base> <port> — echoes one IP per line for every host in
 # <base>.1-254 with <port> open. Prefers nmap (fast, one process) and falls
 # back to a parallel bash /dev/tcp sweep if nmap isn't installed.
+#
+# The base and the port reach the probe as ARGUMENTS ($1, $2), never pasted
+# into the bash -c string: that is what let a --port value run commands. Both
+# are checked here as well, as the last stop before a shell sees them.
 _scan_lan_for_port() {
     local base="$1" port="$2"
+    [[ "$base" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || error_exit "Not a /24 base: '${base}'."
+    _require_port discover-realm "$port"
     if command -v nmap &>/dev/null; then
         nmap -p "$port" --open -T4 -n "${base}.0/24" -oG - 2>/dev/null \
             | awk -v p="$port" '$0 ~ p"/open" {print $2}'
     else
+        # shellcheck disable=SC2016  # $1/$2 are the inner shells', on purpose
         seq 1 254 | xargs -P 64 -I{} bash -c \
-            "timeout 0.4 bash -c 'echo >/dev/tcp/${base}.{}/${port}' 2>/dev/null && echo ${base}.{}"
+            'timeout 0.4 bash -c "echo >/dev/tcp/$1/$2" 2>/dev/null && echo "$1"' _ "${base}.{}" "$port"
     fi
 }
 
@@ -348,6 +396,7 @@ cmd_discover_realm() {
         --set)  do_set=1; shift ;;
         *) error_exit "discover-realm: unknown flag: $1" ;;
     esac; done
+    _require_port discover-realm "$port"
 
     local base
     base="$(_local_subnet_base)" || error_exit "Could not determine this host's LAN subnet (no default route?). Set the realm address manually with 'set DEFAULT_REALM_ADDRESS <ip>' instead."
@@ -390,6 +439,7 @@ cmd_configure() {
     _settings
 
     [[ -n "$CLIENT_SOURCE_DIR" ]] || error_exit "CLIENT_SOURCE_DIR not set — 'set CLIENT_SOURCE_DIR /path/to/vanilla/client' first."
+    _require_client_source
     [[ -d "$CLIENT_SOURCE_DIR" ]] || error_exit "Directory not found: ${CLIENT_SOURCE_DIR}"
     [[ -f "${CLIENT_SOURCE_DIR}/WoW.exe" || -f "${CLIENT_SOURCE_DIR}/wow.exe" ]] \
         || error_exit "No WoW.exe found under ${CLIENT_SOURCE_DIR} — is this really the client's install directory?"
@@ -527,6 +577,10 @@ _write_realmlist() {
     realm="$(_effective_realm "$name")"
     addr="${realm%:*}" port="${realm##*:}"
     [[ -z "$addr" ]] && { warn "No realm address set for '${name}' (global default is empty too) — 'set DEFAULT_REALM_ADDRESS <ip>' (or 'discover-realm --set'), or 'edit-instance --name ${name} --realm <ip>'."; return 1; }
+    # Checked here too, not only where the values come in: a config file
+    # written before those checks, or by hand, still reaches this file.
+    _require_realm_address "realm for '${name}'" "$addr"
+    _require_port "realm port for '${name}'" "$port"
 
     value="$addr"
     [[ "$port" != "3724" ]] && value+=":${port}"
@@ -582,12 +636,25 @@ _write_window_config() {
 # add-instance — provisions a Bottles bottle + client directory for one box
 # -----------------------------------------------------------------------------
 
+# _add_instance_rollback — the EXIT trap add-instance holds while it works.
+# The name passed _require_valid_name before it was recorded, so both paths
+# are a plain directory under INSTANCES_DIR / Bottles' data dir.
+_ROLLBACK_INSTANCE="" _ROLLBACK_BOTTLE=0
+_add_instance_rollback() {
+    [[ -n "$_ROLLBACK_INSTANCE" ]] || return 0
+    local name="$_ROLLBACK_INSTANCE"; _ROLLBACK_INSTANCE=""
+    warn "add-instance did not finish — removing the partial '${name}' so it can be retried."
+    rm -rf -- "$(_instance_dir "$name")"
+    if (( _ROLLBACK_BOTTLE )); then rm -rf -- "$(_bottle_dir "$name")"; fi
+}
+
 cmd_add_instance() {
     header "dark-portal — Add instance"
     _settings
     _ensure_bottles_ready
 
     [[ -n "$CLIENT_SOURCE_DIR" ]] || error_exit "Not configured yet — run 'configure' first."
+    _require_client_source
 
     local name="" res_input="" realm_input="" port_input=""
     while [[ $# -gt 0 ]]; do case "$1" in
@@ -599,12 +666,22 @@ cmd_add_instance() {
     esac; done
 
     _require_valid_name add-instance "$name"
+    [[ -z "$realm_input" ]] || _require_realm_address add-instance "$realm_input"
+    [[ -z "$port_input" ]]  || _require_port add-instance "$port_input"
     [[ -d "$(_instance_dir "$name")" ]] && error_exit "Instance '${name}' already exists."
 
     local dir client bottle
     dir="$(_instance_dir "$name")"
     client="$(_instance_client "$name")"
     bottle="$(_bottle_name "$name")"
+    # From here until the end, any exit (a failed bottle, a failed copy,
+    # Ctrl-C) rolls back what this run made. A half-made instance used to stay
+    # behind, and every retry then stopped at "already exists". The bottle is
+    # removed only if this run is the one that created it.
+    _ROLLBACK_INSTANCE="$name"
+    _ROLLBACK_BOTTLE=1
+    [[ -e "$(_bottle_dir "$name")" ]] && _ROLLBACK_BOTTLE=0
+    trap '_add_instance_rollback' EXIT
     mkdir -p "$dir"
 
     if [[ -n "$res_input" ]]; then
@@ -650,6 +727,8 @@ cmd_add_instance() {
     _write_realmlist "$name" || true
     _write_window_config "$name"
 
+    _ROLLBACK_INSTANCE=""
+    trap - EXIT
     success "Instance '${name}' provisioned. Launch it with 'launch --name ${name}', then log in and create your character as usual — WoW itself has no config for this, account credentials live only in the game/server."
 }
 
@@ -717,6 +796,8 @@ cmd_edit_instance() {
     esac; done
 
     _require_valid_name edit-instance "$name"
+    [[ -z "$realm_input" ]]     || _require_realm_address edit-instance "$realm_input"
+    [[ "$got_port" -eq 0 ]]     || _require_port edit-instance "$port_input"
     [[ -d "$(_instance_dir "$name")" ]] || error_exit "No such instance: ${name}"
 
     local iconf; iconf="$(_instance_conf "$name")"
@@ -760,9 +841,10 @@ cmd_remove_instance() {
     _require_valid_name remove-instance "$name"
     [[ -d "$(_instance_dir "$name")" ]] || error_exit "No such instance: ${name}"
 
-    if _instance_running "$name"; then
-        _stop_instance_by_name "$name" || true
-    fi
+    # Always, not only when the pidfile says it runs: a game with no pidfile
+    # was deleted out from under. And only once it really has stopped.
+    _stop_instance_by_name "$name" \
+        || error_exit "Not removing '${name}': its game is still running. Stop it (or close the client), then retry."
     rm -rf "$(_instance_dir "$name")"
     rm -rf "$(_bottle_dir "$name")"
     success "Instance '${name}' removed."
@@ -811,6 +893,13 @@ cmd_launch() {
     _require_valid_name launch "$name"
     [[ -d "$(_instance_dir "$name")" ]] || error_exit "No such instance: ${name}"
 
+    # One launch of an instance at a time, and the lock BEFORE the running
+    # check: two 'launch X' started together both passed that check before
+    # either had written a pidfile, and both started a client.
+    if ! _instance_lock_acquire "$name"; then
+        warn "'${name}' is being launched by another process right now."
+        return 0
+    fi
     if _instance_running "$name"; then
         warn "'${name}' already appears to be running (pid file present)."
         return 0
@@ -853,12 +942,23 @@ cmd_launch() {
     # instance is running, any leftover window claim is by definition stale
     # (see _reap_window_claims) — checked under the lock, so a sibling that
     # has only just claimed can't be mistaken for "nothing running".
+    #
+    # xdotool only helps with a display it can reach. Without one, the
+    # snapshot below failed under set -e: launch exited 1 straight after its
+    # header, started nothing, and left the launch lock behind. Now the title
+    # keeper is skipped instead, and the game is launched as usual.
     local before_windows="" have_xdotool=0
     if command -v xdotool &>/dev/null; then
-        have_xdotool=1
+        if xdotool getdisplaygeometry &>/dev/null; then
+            have_xdotool=1
+        else
+            warn "xdotool cannot reach an X display (DISPLAY='${DISPLAY:-}') — '${name}' launches without a held window title."
+        fi
+    fi
+    if (( have_xdotool )); then
         _launch_lock_acquire
         _any_instance_running || _reap_window_claims --all
-        before_windows="$(xdotool search --name "." 2>/dev/null)"
+        before_windows="$(xdotool search --name "." 2>/dev/null || true)"
     fi
 
     info "Launching '${name}' (windowed ${res}, realm $(_effective_realm "$name"))..."
@@ -906,7 +1006,43 @@ cmd_launch() {
     else
         (( have_xdotool )) && _launch_lock_release
         warn "'${name}' did not seem to start — check $(_instance_dir "$name")/wine.log"
+        # Non-zero: this used to exit 0, so a script or the TUI read a
+        # failed launch as a successful one.
+        return 1
     fi
+}
+
+# _instance_lock_acquire <name> — the per-instance launch lock (mkdir:
+# atomic), INSTANCES_DIR/<name>/launch.lock, released on exit. Returns 1 if a
+# live launch of the same instance holds it. A lock whose owner is dead is
+# broken at once, and so is one with no owner after a minute (a launch killed
+# between its mkdir and writing its PID).
+_INSTANCE_LOCK=""
+_instance_lock_acquire() {
+    local lock owner gone
+    lock="$(_instance_dir "$1")/launch.lock"
+    if ! mkdir "$lock" 2>/dev/null; then
+        owner="$(cat "${lock}/owner" 2>/dev/null || true)"
+        if [[ -n "$owner" ]]; then
+            kill -0 "$owner" 2>/dev/null && return 1
+        else
+            [[ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]] || return 1
+        fi
+        gone="${lock}.stale.${BASHPID}"
+        mv "$lock" "$gone" 2>/dev/null && rm -rf "$gone"
+        mkdir "$lock" 2>/dev/null || return 1
+    fi
+    echo "$BASHPID" > "${lock}/owner"
+    _INSTANCE_LOCK="$lock"
+    trap '_instance_lock_release' EXIT
+}
+
+_instance_lock_release() {
+    if [[ -n "$_INSTANCE_LOCK" && "$(cat "${_INSTANCE_LOCK}/owner" 2>/dev/null || true)" == "$BASHPID" ]]; then
+        rm -rf "$_INSTANCE_LOCK"
+    fi
+    _INSTANCE_LOCK=""
+    return 0
 }
 
 # _any_instance_running — true if any instance's pidfile points at a live
@@ -1036,7 +1172,7 @@ _launch_lock_release() {
 # is stale and gets swept (_reap_window_claims) rather than blocking that
 # window id until the next reboot.
 _title_find_window() {
-    local name="$1" before="$2" client wid waited
+    local name="$1" before="$2" client wid waited exe_re
     local candidates cand WIDTH HEIGHT area best_area best_cand cand_title other_names
 
     client="$(_instance_client "$name")"
@@ -1101,15 +1237,25 @@ _title_keeper() {
     done
 }
 
+# _stop_instance_by_name <name> — stops whatever is running from this
+# instance's client, then confirms nothing is. Returns 1 if something still is.
+#
+# The pidfile only decides whether its OWN pid gets signalled. It used to
+# decide everything: a missing or stale pidfile returned "not running" before
+# the wineserver -k / pkill below ever ran, so a game whose pidfile was gone
+# (deleted, or the launcher restarted) kept running — and remove-instance then
+# deleted its client and bottle under it.
 _stop_instance_by_name() {
-    local name="$1" pidfile pid
+    local name="$1" pidfile pid="" pattern
     pidfile="$(_instance_pidfile "$name")"
+    pattern="$(_instance_exe_pattern "$name")"
+    [[ -f "$pidfile" ]] && pid="$(cat "$pidfile")"
 
-    if [[ ! -f "$pidfile" ]]; then
+    if ! pgrep -f "$pattern" >/dev/null 2>&1 && ! { [[ -n "$pid" ]] && _pid_is_instance "$name" "$pid"; }; then
+        rm -f "$pidfile"
         info "'${name}' not running."
         return 0
     fi
-    pid="$(cat "$pidfile")"
 
     # wineserver -k tears down every process tied to this bottle (explorer,
     # the game, any helper processes it spawned) — more reliable than killing
@@ -1126,14 +1272,22 @@ _stop_instance_by_name() {
     # and the pidfile PID is only signalled once its argv proves it's still
     # ours — a stale file from before a reboot may point at anything.
     _wine_run "$name" wineserver -k 2>/dev/null || true
-    if _pid_is_instance "$name" "$pid"; then
+    if [[ -n "$pid" ]] && _pid_is_instance "$name" "$pid"; then
         kill "$pid" 2>/dev/null || true
     else
-        info "Stale pid file for '${name}' (pid ${pid} is gone or not ours) — skipping it."
+        info "No live pid file for '${name}'${pid:+ (pid ${pid} is gone or not ours)} — stopping it by its exe path instead."
     fi
     sleep 1
-    pkill -9 -f "$(_instance_exe_pattern "$name")" 2>/dev/null || true
+    pkill -9 -f "$pattern" 2>/dev/null || true
     rm -f "$pidfile"
+    local waited=0
+    while pgrep -f "$pattern" >/dev/null 2>&1 && (( waited < 5 )); do
+        sleep 1; waited=$((waited + 1))
+    done
+    if pgrep -f "$pattern" >/dev/null 2>&1; then
+        warn "'${name}' is still running after wineserver -k and pkill -9."
+        return 1
+    fi
     success "'${name}' stopped."
 }
 
@@ -1162,14 +1316,17 @@ cmd_stop_all() {
     local names; names="$(_list_instance_names)"
     [[ -z "$names" ]] && { info "No instances configured."; return 0; }
 
-    local name
+    # Every instance, not only those whose pidfile is live: see
+    # _stop_instance_by_name.
+    local name failed=0
     while IFS= read -r name; do
         [[ -z "$name" ]] && continue
-        _instance_running "$name" && _stop_instance_by_name "$name"
+        _stop_instance_by_name "$name" || failed=1
     done <<< "$names"
     # Keepers exit on their own once their game is gone and release their
     # claims; anything still there now belonged to a keeper that was killed.
     _any_instance_running || _reap_window_claims --all
+    return "$failed"
 }
 
 # -----------------------------------------------------------------------------
@@ -1181,8 +1338,24 @@ cmd_stop_all() {
 cmd_set() {
     _settings
     [[ $# -eq 2 ]] || error_exit "set: usage: set KEY VALUE"
-    cfg_set "$1" "$2"
-    success "Set ${1}."
+    local key="$1" val="$2"
+    case "$key" in
+        DEFAULT_REALM_PORT)    _require_port set "$val" ;;
+        DEFAULT_REALM_ADDRESS) [[ -z "$val" ]] || _require_realm_address set "$val" ;;
+        CLIENT_SOURCE_DIR)
+            # Stored absolute. A relative path meant something else to every
+            # later command - each resolved it against its own cwd - and
+            # shared mode's symlinks pointed nowhere. '~' is kept as typed:
+            # _settings expands it.
+            # shellcheck disable=SC2088  # the literal tilde is the point here
+            if [[ -n "$val" && "$val" != /* && "$val" != "~" && "$val" != "~/"* ]]; then
+                val="$(realpath -m -- "$val")"
+                info "CLIENT_SOURCE_DIR is relative — storing it as ${val}."
+            fi
+            ;;
+    esac
+    cfg_set "$key" "$val"
+    success "Set ${key}."
 }
 
 cmd_get() {
@@ -1191,12 +1364,16 @@ cmd_get() {
     # Return the EFFECTIVE value: for a known setting _settings has already
     # resolved it (config value or default), so echo that global; otherwise the
     # raw config store. Lets the front-end pre-fill prompts with real defaults.
-    local key="$1"
-    if declare -p "$key" &>/dev/null; then
-        printf '%s\n' "${!key}"
-    else
-        cfg_get "$key"
-    fi
+    #
+    # Known settings by name, not 'declare -p "$key"': that answered for any
+    # shell variable, so 'get PATH' or 'get CONFIG_FILE' printed this script's
+    # own state instead of the config's.
+    local key="$1" k
+    [[ "$key" =~ $CFG_KEY_RE ]] || error_exit "get: invalid key '${key}' (A-Z, 0-9 and '_')."
+    for k in "${SETTING_KEYS[@]}"; do
+        [[ "$k" == "$key" ]] && { printf '%s\n' "${!key}"; return 0; }
+    done
+    cfg_get "$key"
 }
 
 cmd_config() {

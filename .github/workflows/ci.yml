@@ -1,0 +1,29 @@
+name: ci
+
+# Every push and pull request. The suite needs no network, no tokens and no
+# services: flatpak and xdotool are stubbed, and it works in a temporary HOME.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Versions
+        run: |
+          bash --version | head -1
+          shellcheck --version | sed -n 2p
+
+      - name: shellcheck
+        run: shellcheck -S warning dark-portal.sh tests/test-engine.sh tests/stubs/flatpak tests/stubs/xdotool
+
+      - name: tests
+        run: tests/test-engine.sh
