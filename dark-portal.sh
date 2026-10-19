@@ -213,15 +213,18 @@ cfg_default() { _cfg_default "$CONFIG_FILE" "$1" "$2"; }
 # string in discover-realm's scan and realmlist.wtf in launch, so it is a
 # number or it is refused: '--port "1; touch X; :"' ran touch 64 times.
 _require_port() {
-    [[ "$2" =~ ^[0-9]{1,5}$ ]] && (( 10#$2 >= 1 && 10#$2 <= 65535 )) \
-        || error_exit "$1: port must be a number from 1 to 65535 (got '$2')."
+    _is_port "$2" || error_exit "$1: port must be a number from 1 to 65535 (got '$2')."
 }
 
 # _require_realm_address <what> <value>
 _require_realm_address() {
-    [[ "$2" =~ $REALM_ADDRESS_RE ]] \
-        || error_exit "$1: realm address must be a hostname or IP address (got '$2')."
+    _is_realm_address "$2" || error_exit "$1: realm address must be a hostname or IP address (got '$2')."
 }
+
+# The checks themselves, without the exit: _write_realmlist runs under
+# callers that carry on when it fails (add-instance, edit-instance).
+_is_port()          { [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
+_is_realm_address() { [[ "$1" =~ $REALM_ADDRESS_RE ]]; }
 
 # -----------------------------------------------------------------------------
 # Resolved settings (read fresh each invocation)
@@ -578,9 +581,12 @@ _write_realmlist() {
     addr="${realm%:*}" port="${realm##*:}"
     [[ -z "$addr" ]] && { warn "No realm address set for '${name}' (global default is empty too) — 'set DEFAULT_REALM_ADDRESS <ip>' (or 'discover-realm --set'), or 'edit-instance --name ${name} --realm <ip>'."; return 1; }
     # Checked here too, not only where the values come in: a config file
-    # written before those checks, or by hand, still reaches this file.
-    _require_realm_address "realm for '${name}'" "$addr"
-    _require_port "realm port for '${name}'" "$port"
+    # written before those checks, or by hand, still reaches this file. A
+    # warning and return 1, not an exit: add-instance and edit-instance carry
+    # on without the file (|| true) - an exit there threw away a finished
+    # client copy - and launch stops on it (|| return 1) (Kamino item 107).
+    _is_realm_address "$addr" || { warn "Realm address for '${name}' is not a hostname or IP address ('${addr}') — realmlist.wtf not written. Fix it with 'edit-instance --name ${name} --realm <ip>' or 'set DEFAULT_REALM_ADDRESS <ip>'."; return 1; }
+    _is_port "$port" || { warn "Realm port for '${name}' is not a number from 1 to 65535 ('${port}') — realmlist.wtf not written."; return 1; }
 
     value="$addr"
     [[ "$port" != "3724" ]] && value+=":${port}"
@@ -678,11 +684,18 @@ cmd_add_instance() {
     # Ctrl-C) rolls back what this run made. A half-made instance used to stay
     # behind, and every retry then stopped at "already exists". The bottle is
     # removed only if this run is the one that created it.
+    #
+    # The folder is claimed first, with a plain mkdir that fails if it exists,
+    # and only then is the rollback armed: two runs for one name both passed
+    # the check above, both armed it, and the one that failed deleted the
+    # other's bottle (Kamino item 107). Now the second stops here, owning
+    # nothing.
+    mkdir -p "$(dirname "$dir")"
+    mkdir "$dir" 2>/dev/null || error_exit "Instance '${name}' already exists."
     _ROLLBACK_INSTANCE="$name"
     _ROLLBACK_BOTTLE=1
     [[ -e "$(_bottle_dir "$name")" ]] && _ROLLBACK_BOTTLE=0
     trap '_add_instance_rollback' EXIT
-    mkdir -p "$dir"
 
     if [[ -n "$res_input" ]]; then
         [[ "$res_input" =~ $RESOLUTION_RE ]] || error_exit "Invalid resolution '${res_input}' (expected WxH)."
@@ -1018,18 +1031,33 @@ cmd_launch() {
 # broken at once, and so is one with no owner after a minute (a launch killed
 # between its mkdir and writing its PID).
 _INSTANCE_LOCK=""
+# _lock_is_stale DIR OWNER — a lock whose owner is dead, or one with no owner
+# file that is over a minute old (a launch dies between mkdir and writing it).
+_lock_is_stale() {
+    if [[ -n "$2" ]]; then
+        ! kill -0 "$2" 2>/dev/null
+    else
+        [[ -n "$(find "$1" -maxdepth 0 -mmin +1 2>/dev/null)" ]]
+    fi
+}
+
 _instance_lock_acquire() {
     local lock owner gone
     lock="$(_instance_dir "$1")/launch.lock"
     if ! mkdir "$lock" 2>/dev/null; then
         owner="$(cat "${lock}/owner" 2>/dev/null || true)"
-        if [[ -n "$owner" ]]; then
-            kill -0 "$owner" 2>/dev/null && return 1
-        else
-            [[ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]] || return 1
-        fi
+        _lock_is_stale "$lock" "$owner" || return 1
         gone="${lock}.stale.${BASHPID}"
-        mv "$lock" "$gone" 2>/dev/null && rm -rf "$gone"
+        if mv "$lock" "$gone" 2>/dev/null; then
+            # Another launch may have broken this same stale lock and taken a
+            # fresh one between the look above and this mv: then what moved is
+            # ITS lock. Put it back and stand down (Kamino item 107).
+            if [[ "$(cat "${gone}/owner" 2>/dev/null || true)" != "$owner" ]] || ! _lock_is_stale "$gone" "$owner"; then
+                [[ -e "$lock" ]] || mv "$gone" "$lock" 2>/dev/null
+                return 1
+            fi
+            rm -rf "$gone"
+        fi
         mkdir "$lock" 2>/dev/null || return 1
     fi
     echo "$BASHPID" > "${lock}/owner"

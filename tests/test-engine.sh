@@ -140,6 +140,68 @@ hdr "38 — exe_re is local"
 body="$(sed -n '/^_title_find_window() {/,/^}/p' "$ENG")"
 chk "declared local in _title_find_window"     'grep -qE "^ +local .*\bexe_re\b" <<<"$body"'
 
+# ---------------------------------------------------------------- 107
+hdr "107 — two add-instance runs for one name"
+# Both must pass the "already exists" check before either claims the folder:
+# a mkdir on PATH pauses one second for this instance's folder only. A then
+# makes the bottle; B, 0.3s behind, is told its bottle creation fails.
+REAL_MKDIR="$(command -v mkdir)"
+mkdir -p "$T/slow"
+cat > "$T/slow/mkdir" <<SLOW
+#!/usr/bin/env bash
+for a in "\$@"; do [[ "\$a" == "$INST/race" ]] && sleep 1; done
+exec "$REAL_MKDIR" "\$@"
+SLOW
+chmod +x "$T/slow/mkdir"
+BOTTLE_RACE="$HOME/.var/app/com.usebottles.bottles/data/bottles/bottles/dp-race"
+( PATH="$T/slow:$PATH" run add-instance --name race > "$T/race-a.out" ) &
+sleep 0.3
+outb="$(PATH="$T/slow:$PATH" STUB_BOTTLE_FAIL=1 run add-instance --name race)"; rcb=$?
+wait
+chk "the second run is refused: already exists" '[[ $rcb -ne 0 ]] && grep -q "already exists" <<<"$outb"'
+chk "  and the first run's instance survives"   '[[ -d "$INST/race/client" ]]'
+chk "  with its bottle"                         '[[ -d "$BOTTLE_RACE" ]]'
+
+hdr "107 — a stored realm address the checks now refuse"
+cp "$CONF" "$T/conf.bak"
+sed -i 's/^DEFAULT_REALM_ADDRESS=.*/DEFAULT_REALM_ADDRESS="wow_server.lan"/' "$CONF"
+out="$(run add-instance --name oldaddr)"; rc=$?
+chk "add-instance still provisions the instance" '[[ $rc -eq 0 && -d "$INST/oldaddr/client" ]]'
+chk "  warning that realmlist.wtf was not written" 'grep -q "realmlist.wtf not written" <<<"$out"'
+chk "  and writes none"                         '[[ ! -e "$INST/oldaddr/client/realmlist.wtf" ]]'
+cp "$T/conf.bak" "$CONF"
+
+hdr "107 — breaking a stale launch lock"
+# The engine's lock functions, run here. Between this launch's look at the
+# stale lock and its mv, another launch breaks the same lock and takes a fresh
+# one: the mv below does that first, once, then the real move.
+fns="$(sed -n '/^_lock_is_stale() {/,/^}/p; /^_instance_lock_acquire() {/,/^}/p; /^_instance_lock_release() {/,/^}/p' "$ENG")"
+cat > "$T/lockrace.sh" <<'RACE'
+set -u
+eval "$FNS"
+_instance_dir() { printf '%s' "$LDIR"; }
+lock="$LDIR/launch.lock"
+mkdir -p "$lock"; echo 2147483646 > "$lock/owner"        # a dead owner: stale
+raced=0
+mv() {
+    if (( ! raced )) && [[ "$1" == "$lock" ]]; then
+        raced=1
+        command mv "$lock" "$lock.other" && rm -rf "$lock.other"  # the other launch breaks it
+        command mkdir "$lock" && echo "$OTHER" > "$lock/owner"   # and takes a fresh one
+    fi
+    command mv "$@"
+}
+if _instance_lock_acquire x; then echo "took it"; else echo "stood down"; fi
+echo "owner now: $(cat "$lock/owner" 2>/dev/null)"
+RACE
+out="$(FNS="$fns" LDIR="$T/lockrace" OTHER="$$" bash "$T/lockrace.sh" 2>&1)"
+chk "the launch that came second stands down"  'grep -q "stood down" <<<"$out"'
+chk "  and the other launch keeps its fresh lock" 'grep -q "owner now: $$" <<<"$out"'
+rm -rf "$T/lockrace"; mkdir -p "$T/lockrace"; echo 2147483646 > "$T/lockrace/x"
+plain="$(sed 's/^mv() {/nomv() {/' "$T/lockrace.sh")"
+out="$(FNS="$fns" LDIR="$T/lockrace" OTHER="$$" bash -c "$plain" 2>&1)"
+chk "a lock that is only stale is still broken (control)" 'grep -q "took it" <<<"$out"'
+
 echo
 echo "pass=${pass} fail=${fail}"
 (( fail == 0 ))
