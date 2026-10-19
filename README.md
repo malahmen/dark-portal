@@ -176,7 +176,14 @@ absolute path (one already stored relative, by hand, is refused by
 - `stop` and `remove-instance` stop a game by its exe path even when its
   pidfile is missing or stale, and `remove-instance` refuses to delete an
   instance whose game is still running.
-- A failed `add-instance` removes what it made, so it can be retried.
+- A failed `add-instance` removes what it made, so it can be retried. It
+  claims the instance folder before anything else, so two runs for one name
+  never undo each other: the second stops at "already exists".
+- A stored realm address or port that is no longer valid (written by hand, or
+  before these checks) does not abort `add-instance` or `edit-instance`: they
+  finish without `realmlist.wtf`, say so, and `launch` refuses until it is
+  fixed.
+- A launch lock left by a dead launch is broken by one launch only.
 
 ## Testing
 
