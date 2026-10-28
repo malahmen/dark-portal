@@ -171,36 +171,128 @@ chk "  warning that realmlist.wtf was not written" 'grep -q "realmlist.wtf not w
 chk "  and writes none"                         '[[ ! -e "$INST/oldaddr/client/realmlist.wtf" ]]'
 cp "$T/conf.bak" "$CONF"
 
-hdr "107 — breaking a stale launch lock"
-# The engine's lock functions, run here. Between this launch's look at the
-# stale lock and its mv, another launch breaks the same lock and takes a fresh
-# one: the mv below does that first, once, then the real move.
-fns="$(sed -n '/^_lock_is_stale() {/,/^}/p; /^_instance_lock_acquire() {/,/^}/p; /^_instance_lock_release() {/,/^}/p' "$ENG")"
+hdr "107, 207 — breaking a stale launch lock"
+# The engine's lock functions, run here against a lock left by a dead launch
+# (A is this launch). RACE picks what other launches do meanwhile:
+#   b   between A's look at the stale lock and anything A does about it, B
+#       breaks it and takes a fresh one (107)
+#   bc  as b, and a third launch C tries to take the lock before every file
+#       step A makes (207: A moved B's lock aside, C took the name, B's lock
+#       was orphaned and B and C both held it)
+#   b0  as b, for a lock with no owner file, and B has not written its own yet
+#   bb  just before A removes the stale lock, B (honouring the break lock)
+#       removes it too, then C tries before every later step: two breakers
+#       must not both act on one look
+# (_launch_lock_break is the pre-207 helper, so this also runs on that engine.)
+fns="$(sed -n '/^_lock_is_stale() {/,/^}/p; /^_lock_break() {/,/^}/p; /^_instance_lock_acquire() {/,/^}/p; /^_instance_lock_release() {/,/^}/p; /^_launch_lock_acquire() {/,/^}/p; /^_launch_lock_release() {/,/^}/p; /^_launch_lock_break() {/,/^}/p' "$ENG")"
 cat > "$T/lockrace.sh" <<'RACE'
 set -u
 eval "$FNS"
+error_exit() { echo "error: $*"; exit 1; }
 _instance_dir() { printf '%s' "$LDIR"; }
 lock="$LDIR/launch.lock"
-mkdir -p "$lock"; echo 2147483646 > "$lock/owner"        # a dead owner: stale
-raced=0
-mv() {
-    if (( ! raced )) && [[ "$1" == "$lock" ]]; then
-        raced=1
-        command mv "$lock" "$lock.other" && rm -rf "$lock.other"  # the other launch breaks it
-        command mkdir "$lock" && echo "$OTHER" > "$lock/owner"   # and takes a fresh one
+command mkdir -p "$lock"
+if [[ "$RACE" == b0 ]]; then touch -d '-2 minutes' "$lock"; else echo 2147483646 > "$lock/owner"; fi
+eval "orig_$(declare -f _lock_is_stale)"
+_lock_is_stale() {
+    orig__lock_is_stale "$@" || return 1
+    if [[ "$RACE" == b* && "$RACE" != bb && ! -e "$LDIR/b.done" ]]; then
+        : > "$LDIR/b.done"
+        command rm -rf "$lock"; command mkdir "$lock"
+        [[ "$RACE" == b0 ]] || echo "$B" > "$lock/owner"
     fi
-    command mv "$@"
 }
-if _instance_lock_acquire x; then echo "took it"; else echo "stood down"; fi
-echo "owner now: $(cat "$lock/owner" 2>/dev/null)"
+c_try() {
+    [[ "$RACE" == bc || "$RACE" == bb ]] && [[ -e "$LDIR/b.done" && ! -e "$LDIR/c.done" ]] || return 0
+    command mkdir "$lock" 2>/dev/null && echo "$C" > "$lock/owner" && : > "$LDIR/c.done"
+}
+cat()   { c_try; command cat "$@"; }
+mv()    { c_try; command mv "$@"; }
+mkdir() { c_try; command mkdir "$@"; }
+rm() {
+    if [[ "$RACE" == bb && ! -e "$LDIR/b.done" ]]; then
+        : > "$LDIR/b.done"
+        flock -n "$lock.break" rm -rf "$lock"
+    fi
+    c_try; command rm "$@"
+}
+if _instance_lock_acquire x; then echo "A took it"; else echo "A stood down"; fi
+[[ -e "$LDIR/c.done" ]] && echo "C took it"
+echo "owner now: $(command cat "$lock/owner" 2>/dev/null)"
+echo "left: $(cd "$LDIR" && echo *)"
 RACE
-out="$(FNS="$fns" LDIR="$T/lockrace" OTHER="$$" bash "$T/lockrace.sh" 2>&1)"
-chk "the launch that came second stands down"  'grep -q "stood down" <<<"$out"'
-chk "  and the other launch keeps its fresh lock" 'grep -q "owner now: $$" <<<"$out"'
-rm -rf "$T/lockrace"; mkdir -p "$T/lockrace"; echo 2147483646 > "$T/lockrace/x"
-plain="$(sed 's/^mv() {/nomv() {/' "$T/lockrace.sh")"
-out="$(FNS="$fns" LDIR="$T/lockrace" OTHER="$$" bash -c "$plain" 2>&1)"
-chk "a lock that is only stale is still broken (control)" 'grep -q "took it" <<<"$out"'
+race() { command rm -rf "$T/lockrace"; mkdir -p "$T/lockrace"; FNS="$fns" LDIR="$T/lockrace" RACE="$1" B="$$" C="$PPID" bash "$T/lockrace.sh" 2>&1; }
+out="$(race b)"
+chk "the launch that came second stands down"  'grep -q "A stood down" <<<"$out"'
+chk "  and the other launch keeps its fresh lock" 'grep -q "owner now: $$\$" <<<"$out"'
+out="$(race bc)"
+chk "207: with a third launch, A still stands down" 'grep -q "A stood down" <<<"$out"'
+chk "  B keeps its lock"                       'grep -q "owner now: $$\$" <<<"$out"'
+chk "  C does not get one too"                 '! grep -q "C took it" <<<"$out"'
+chk "  and no lock is orphaned aside"          '! grep -q "stale\." <<<"$out"'
+out="$(race b0)"
+chk "an ownerless fresh lock is not broken either" 'grep -q "A stood down" <<<"$out" && grep -q "left: .*launch.lock" <<<"$out"'
+out="$(race bb)"
+chk "two breakers of one stale lock: one holder" '! { grep -q "A took it" <<<"$out" && grep -q "C took it" <<<"$out"; }'
+out="$(race none)"
+chk "a lock that is only stale is still broken (control)" 'grep -q "A took it" <<<"$out"'
+
+hdr "207 — the launch lock: break, release"
+cat > "$T/launchlock.sh" <<'LL'
+set -u
+eval "$FNS"
+error_exit() { echo "error: $*"; exit 1; }
+warn() { echo "warn: $*"; }; info() { :; }
+LAUNCH_LOCK_DIR="$LDIR/launch.lock"
+mkdir -p "$LAUNCH_LOCK_DIR"; echo 2147483646 > "$LAUNCH_LOCK_DIR/owner"
+_launch_lock_acquire && echo "owner now: $(cat "$LAUNCH_LOCK_DIR/owner")" && echo "me: $BASHPID"
+echo "$B" > "$LAUNCH_LOCK_DIR/owner"; _launch_lock_release
+[[ -d "$LAUNCH_LOCK_DIR" ]] && echo "release left B's lock"
+echo "$BASHPID" > "$LAUNCH_LOCK_DIR/owner"; _launch_lock_release
+[[ -d "$LAUNCH_LOCK_DIR" ]] || echo "release dropped its own"
+# Just before this launch's release removes its lock, a waiter that has given
+# up on it after 90s (honouring the break lock) breaks it and N takes it.
+mkdir -p "$LAUNCH_LOCK_DIR"; echo "$BASHPID" > "$LAUNCH_LOCK_DIR/owner"
+rm() {
+    if [[ ! -e "$LDIR/n.done" ]]; then
+        : > "$LDIR/n.done"
+        flock -n "$LAUNCH_LOCK_DIR.break" bash -c 'rm -rf "$1" && mkdir "$1" && echo "$2" > "$1/owner" && echo "N took it"' _ "$LAUNCH_LOCK_DIR" "$B"
+    fi
+    command rm "$@"
+}
+_launch_lock_release
+[[ -d "$LAUNCH_LOCK_DIR" ]] && echo "N's lock survives"
+LL
+rm -rf "$T/ll"; mkdir -p "$T/ll"
+out="$(FNS="$fns" LDIR="$T/ll" B="$$" bash "$T/launchlock.sh" 2>&1)"
+chk "a dead launch's launch lock is broken and taken" 'grep -q "Breaking stale launch lock" <<<"$out" && [[ "$(sed -n "s/^owner now: //p" <<<"$out")" == "$(sed -n "s/^me: //p" <<<"$out")" ]]'
+chk "  release leaves another launch's lock"   'grep -q "release left B" <<<"$out"'
+chk "  and drops its own"                      'grep -q "release dropped its own" <<<"$out"'
+chk "  a break during release: one holder"     '! grep -q "N took it" <<<"$out" || grep -q "N.s lock survives" <<<"$out"'
+
+hdr "207 — many launches at a lock whose holders keep dying"
+# Each attempt takes the lock, marks itself inside, and half the time exits
+# without releasing (a killed launch), so the next must break a stale lock.
+cat > "$T/smoke.sh" <<'SMOKE'
+eval "$FNS"
+error_exit() { echo "error: $*"; exit 1; }
+_instance_dir() { printf '%s' "$LDIR"; }
+if _instance_lock_acquire x; then
+    mkdir "$LDIR/inside" 2>/dev/null || echo x >> "$LDIR/overlaps"
+    echo x >> "$LDIR/held"
+    sleep 0.02
+    rmdir "$LDIR/inside"
+    (( RANDOM % 2 )) && trap - EXIT
+fi
+exit 0
+SMOKE
+rm -rf "$T/smoke"; mkdir -p "$T/smoke"
+for w in 1 2 3 4 5 6 7 8; do
+    ( for i in $(seq 25); do FNS="$fns" LDIR="$T/smoke" bash "$T/smoke.sh"; done ) &
+done
+wait
+chk "some attempts held the lock (control)"    '[[ -s "$T/smoke/held" ]]'
+chk "  never two at once"                      '[[ ! -e "$T/smoke/overlaps" ]]'
 
 echo
 echo "pass=${pass} fail=${fail}"

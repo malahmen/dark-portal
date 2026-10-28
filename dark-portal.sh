@@ -105,8 +105,9 @@
 #
 # Host tools this leans on at runtime, besides bash >= 4 and flatpak: GNU
 # grep/sed (grep -P, sed -i), coreutils timeout, iproute2's ip
-# (discover-realm's subnet), xdotool (title keeper; optional, launch works
-# without it) and nmap (optional, faster discover-realm).
+# (discover-realm's subnet), util-linux flock (launch's locks), xdotool
+# (title keeper; optional, launch works without it) and nmap (optional,
+# faster discover-realm).
 #
 # Config: ${XDG_CONFIG_HOME:-~/.config}/dark-portal/dark-portal.conf (global)
 #         .../dark-portal/instances/<name>/instance.conf (per-instance)
@@ -1041,23 +1042,30 @@ _lock_is_stale() {
     fi
 }
 
+# _lock_break DIR OWNER [--force] — removes the lock DIR, but only if it is
+# still OWNER's and (without --force) still stale. The look and the rm happen
+# holding DIR.break (flock(1); the kernel drops it if this dies), and every
+# launch that removes a lock it does not own holds it too: so of launches that
+# saw the same stale lock only the first removes it, and none can remove a
+# fresh lock another launch took after its look. Nothing is moved aside and
+# put back (Kamino items 107, 207). Returns 1 if it left DIR alone.
+_lock_break() {
+    command -v flock >/dev/null || error_exit "flock (util-linux) is needed to break a stale lock: ${1}"
+    (
+        flock -w 10 9 || exit 1
+        [[ "$(cat "${1}/owner" 2>/dev/null || true)" == "$2" ]] || exit 1
+        [[ "${3:-}" == "--force" ]] || _lock_is_stale "$1" "$2" || exit 1
+        rm -rf "$1"
+    ) 9>"${1}.break"
+}
+
 _instance_lock_acquire() {
-    local lock owner gone
+    local lock owner
     lock="$(_instance_dir "$1")/launch.lock"
     if ! mkdir "$lock" 2>/dev/null; then
         owner="$(cat "${lock}/owner" 2>/dev/null || true)"
         _lock_is_stale "$lock" "$owner" || return 1
-        gone="${lock}.stale.${BASHPID}"
-        if mv "$lock" "$gone" 2>/dev/null; then
-            # Another launch may have broken this same stale lock and taken a
-            # fresh one between the look above and this mv: then what moved is
-            # ITS lock. Put it back and stand down (Kamino item 107).
-            if [[ "$(cat "${gone}/owner" 2>/dev/null || true)" != "$owner" ]] || ! _lock_is_stale "$gone" "$owner"; then
-                [[ -e "$lock" ]] || mv "$gone" "$lock" 2>/dev/null
-                return 1
-            fi
-            rm -rf "$gone"
-        fi
+        _lock_break "$lock" "$owner" || true
         mkdir "$lock" 2>/dev/null || return 1
     fi
     echo "$BASHPID" > "${lock}/owner"
@@ -1108,21 +1116,21 @@ _reap_window_claims() {
 # is a stale lock and is broken at once. A live holder's phase is bounded to
 # ~10s of start-up polling plus ~30s of window hunting, so waiting well past
 # that and then breaking the lock only ever fires on something wedged, never
-# on a healthy neighbour. Breaking renames the lock dir away first (mv:
-# atomic), so of two waiters that both saw the same stale lock only one gets
-# to remove it — the other's rm can't land on a fresh lock that a third
-# launch took in between.
+# on a healthy neighbour. Breaking goes through _lock_break, which removes
+# the lock only if it is still the one this launch looked at, so of waiters
+# that saw the same stale lock only one removes it, and none removes a fresh
+# lock a third launch took in between.
 _launch_lock_acquire() {
     local waited=0 owner
     until mkdir "$LAUNCH_LOCK_DIR" 2>/dev/null; do
         owner="$(cat "${LAUNCH_LOCK_DIR}/owner" 2>/dev/null || true)"
         if [[ -n "$owner" ]] && ! kill -0 "$owner" 2>/dev/null; then
             warn "Breaking stale launch lock (owner pid ${owner} is gone)."
-            _launch_lock_break; continue
+            _lock_break "$LAUNCH_LOCK_DIR" "$owner" || true; continue
         fi
         if (( waited >= 90 )); then
             warn "Launch lock held for over 90s by pid '${owner}' — breaking it."
-            _launch_lock_break; continue
+            _lock_break "$LAUNCH_LOCK_DIR" "$owner" --force || true; continue
         fi
         (( waited == 0 )) && info "Waiting for a previous launch to claim its window first..."
         sleep 1; waited=$((waited + 1))
@@ -1130,17 +1138,12 @@ _launch_lock_acquire() {
     echo "$BASHPID" > "${LAUNCH_LOCK_DIR}/owner"
 }
 
-_launch_lock_break() {
-    local gone="${LAUNCH_LOCK_DIR}.stale.${BASHPID}"
-    mv "$LAUNCH_LOCK_DIR" "$gone" 2>/dev/null && rm -rf "$gone"
-    return 0
-}
-
 # _launch_lock_release — drops the launch lock, but only if it's still this
 # process's: after a stale-break a different launch may be holding it by now.
+# Under the same flock as _lock_break, so a break of this launch (a wedged
+# one, after 90s) and this rm can't both land, one on the next holder's lock.
 _launch_lock_release() {
-    [[ "$(cat "${LAUNCH_LOCK_DIR}/owner" 2>/dev/null || true)" == "$BASHPID" ]] && rm -rf "$LAUNCH_LOCK_DIR"
-    return 0
+    _lock_break "$LAUNCH_LOCK_DIR" "$BASHPID" --force || true
 }
 
 # _title_find_window <name> <before-windows> — the find-and-claim half of the

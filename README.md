@@ -68,6 +68,7 @@ addon cache never collide.
 | `bash` ≥ 4, `flatpak` | everything | `install-deps` installs Bottles from Flathub |
 | GNU `grep`, GNU `sed` | config/realmlist rewriting, subnet detection | uses `grep -P` and `sed -i` — BSD variants won't do |
 | `timeout` (coreutils), `ip` (iproute2) | `discover-realm` | `ip route` finds the local /24 |
+| `flock` (util-linux) | `launch` | guards breaking a stale lock; on every Linux base system |
 | `xdotool` | stable window titles (`launch`) | optional — without it windows keep the game's own title |
 | `nmap` | faster `discover-realm` | optional — falls back to a slower pure-bash sweep |
 
@@ -183,7 +184,9 @@ absolute path (one already stored relative, by hand, is refused by
   before these checks) does not abort `add-instance` or `edit-instance`: they
   finish without `realmlist.wtf`, say so, and `launch` refuses until it is
   fixed.
-- A launch lock left by a dead launch is broken by one launch only.
+- A launch lock left by a dead launch is broken by one launch only, and never
+  one a live launch has just taken: breaking re-checks the lock while holding
+  a `flock` on `launch.lock.break` beside it, and only then removes it.
 
 ## Testing
 
