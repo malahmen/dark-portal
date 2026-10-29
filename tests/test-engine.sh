@@ -270,6 +270,54 @@ chk "  release leaves another launch's lock"   'grep -q "release left B" <<<"$ou
 chk "  and drops its own"                      'grep -q "release dropped its own" <<<"$out"'
 chk "  a break during release: one holder"     '! grep -q "N took it" <<<"$out" || grep -q "N.s lock survives" <<<"$out"'
 
+hdr "224 — a forced break times each holder's own 90s"
+# A waits on a live B's launch lock on a fake clock (sleep advances it by 1s,
+# nothing really waits). After 90s A force-breaks it; before A's next pass a
+# third launch C takes the lock (CASE c0: C has made the dir but not written
+# its owner yet, which it does on the next tick). C is wedged too, so A must
+# break it as well, but only once C has held it 90s itself. Every forced
+# break is logged with how long its victim had held the lock (an ownerless
+# lock, whose holder A cannot know, counts as just taken).
+cat > "$T/forcebreak.sh" <<'FB'
+set -u
+eval "$FNS"
+error_exit() { echo "error: $*"; exit 1; }
+warn() { echo "warn: $*"; }; info() { :; }
+LAUNCH_LOCK_DIR="$LDIR/launch.lock"
+now=0 pending=""
+declare -A since
+take() {
+    command mkdir "$LAUNCH_LOCK_DIR" 2>/dev/null || return 1
+    since["x$1"]=$now
+    if [[ "$CASE" == c0 && "$1" == "$C" ]]; then pending="$1"; else echo "$1" > "$LAUNCH_LOCK_DIR/owner"; fi
+}
+sleep() {
+    now=$((now + 1))
+    [[ -n "$pending" ]] && { echo "$pending" > "$LAUNCH_LOCK_DIR/owner"; pending=""; }
+    (( now <= 400 )) || { echo "gave up at ${now}s"; exit 1; }
+}
+eval "orig_$(declare -f _lock_break)"
+_lock_break() {
+    local rc=0
+    orig__lock_break "$@" || rc=$?
+    if [[ "${3:-}" == --force ]] && (( rc == 0 )); then
+        echo "force-broke '$2' at ${now}s, held $(( now - ${since["x$2"]:-$now} ))s"
+        if [[ ! -e "$LDIR/c.done" ]]; then : > "$LDIR/c.done"; take "$C"; fi
+    fi
+    return $rc
+}
+take "$B"
+_launch_lock_acquire && echo "A took it at ${now}s"
+FB
+forcebreak() { rm -rf "$T/fb"; mkdir -p "$T/fb"; FNS="$fns" LDIR="$T/fb" CASE="$1" B="$$" C="$PPID" bash "$T/forcebreak.sh" 2>&1; }
+for case in c c0; do
+    out="$(forcebreak "$case")"
+    chk "$case: A force-breaks B after B's 90s (control)" 'grep -q "force-broke .$$. at 90s, held 90s" <<<"$out"'
+    chk "  never a lock held under 90s"        '! grep -Eq "held ([0-9]|[1-8][0-9])s" <<<"$out"'
+    chk "  C, wedged too, is broken after its own 90s" 'grep -Eq "force-broke .$PPID. at 18[01]s, held 9[01]s" <<<"$out"'
+    chk "  and A then takes the lock"          'grep -q "A took it" <<<"$out"'
+done
+
 hdr "207 — many launches at a lock whose holders keep dying"
 # Each attempt takes the lock, marks itself inside, and half the time exits
 # without releasing (a killed launch), so the next must break a stale lock.
