@@ -184,7 +184,7 @@ hdr "107, 207 — breaking a stale launch lock"
 #       removes it too, then C tries before every later step: two breakers
 #       must not both act on one look
 # (_launch_lock_break is the pre-207 helper, so this also runs on that engine.)
-fns="$(sed -n '/^_lock_is_stale() {/,/^}/p; /^_lock_break() {/,/^}/p; /^_instance_lock_acquire() {/,/^}/p; /^_instance_lock_release() {/,/^}/p; /^_launch_lock_acquire() {/,/^}/p; /^_launch_lock_release() {/,/^}/p; /^_launch_lock_break() {/,/^}/p' "$ENG")"
+fns="$(sed -n '/^_lock_is_stale() {/,/^}/p; /^_lock_break() {/,/^}/p; /^_lock_take() {/,/^}/p; /^_instance_lock_acquire() {/,/^}/p; /^_instance_lock_release() {/,/^}/p; /^_launch_lock_acquire() {/,/^}/p; /^_launch_lock_release() {/,/^}/p; /^_launch_lock_break() {/,/^}/p' "$ENG")"
 cat > "$T/lockrace.sh" <<'RACE'
 set -u
 eval "$FNS"
@@ -316,6 +316,100 @@ for case in c c0; do
     chk "  never a lock held under 90s"        '! grep -Eq "held ([0-9]|[1-8][0-9])s" <<<"$out"'
     chk "  C, wedged too, is broken after its own 90s" 'grep -Eq "force-broke .$PPID. at 18[01]s, held 9[01]s" <<<"$out"'
     chk "  and A then takes the lock"          'grep -q "A took it" <<<"$out"'
+done
+
+hdr "207 — no lock appears between a breaker's look and its rm"
+# A looks at the lock, finds it stale and breaks it holding the break lock;
+# meanwhile the lock changes hands. MODE picks how:
+#   reuse  B has just broken a dead launch's lock and is about to take its
+#          own; H takes it first, with a PID A saw dead (the hook on A's
+#          look stands for that PID reuse). A's re-check finds H's PID;
+#          then H releases and exits, B takes the lock, and A's rm must not
+#          remove B's.
+#   stall  X stalled over a minute between creating its owner file and
+#          writing its PID (suspend, SIGSTOP): A, seeing an ownerless lock
+#          that old, breaks it, and X writes its PID just before A's rm: A
+#          must not remove X's lock.
+# A, B and X each print "<name> took it" or "<name> stood down".
+cat > "$T/straddle-peer.sh" <<'PEER'
+eval "$FNS"
+error_exit() { echo "error: $*"; exit 1; }
+_instance_dir() { printf '%s' "$LDIR"; }
+waitfor() { local i; for i in $(seq "${2:-40}"); do [[ -e "$1" ]] && return 0; sleep 0.05; done; return 1; }
+lock="$LDIR/launch.lock"
+if [[ "$NAME" == X ]]; then
+    echo() {
+        if [[ ! -e "$LDIR/X.stalled" ]]; then
+            touch -d '-2 minutes' "$lock"; : > "$LDIR/X.stalled"; waitfor "$LDIR/X.go" 60
+        fi
+        builtin echo "$@"
+    }
+elif [[ "$NAME" == B ]]; then
+    eval "orig_$(declare -f _lock_break)"
+    _lock_break() {
+        local rc=0
+        orig__lock_break "$@" || rc=$?
+        : > "$LDIR/B.broke"; waitfor "$LDIR/B.go" 200
+        return $rc
+    }
+fi
+if _instance_lock_acquire x; then
+    builtin echo "$NAME $([[ "$NAME" == H ]] && builtin echo held || builtin echo took) it" >> "$LDIR/events"
+    builtin echo "$BASHPID" > "$LDIR/$NAME.pid"; : > "$LDIR/$NAME.done"
+    waitfor "$LDIR/$NAME.exit" 200
+else
+    builtin echo "$NAME stood down" >> "$LDIR/events"; : > "$LDIR/$NAME.done"
+fi
+exit 0
+PEER
+cat > "$T/straddle.sh" <<'STRADDLE'
+set -u
+eval "$FNS"
+error_exit() { echo "error: $*"; exit 1; }
+_instance_dir() { printf '%s' "$LDIR"; }
+waitfor() { local i; for i in $(seq "${2:-40}"); do [[ -e "$1" ]] && return 0; sleep 0.05; done; return 1; }
+# (9>&-: a peer started inside _lock_break must not keep its break lock.)
+peer() { ( NAME="$1" bash "$PEER"; : > "$LDIR/$1.gone" ) 9>&- & }
+lock="$LDIR/launch.lock"
+eval "orig_$(declare -f _lock_is_stale)"
+looks=0
+if [[ "$MODE" == reuse ]]; then
+    mkdir "$lock"; echo 2147483646 > "$lock/owner"
+    peer B; waitfor "$LDIR/B.broke" 200
+    peer H; waitfor "$LDIR/H.done" 200
+    _lock_is_stale() {
+        looks=$((looks + 1))
+        (( looks == 1 )) && return 0
+        if (( looks == 2 )); then
+            : > "$LDIR/H.exit"; waitfor "$LDIR/H.gone"
+            : > "$LDIR/B.go"; waitfor "$LDIR/B.done"
+        fi
+        orig__lock_is_stale "$@"
+    }
+else
+    peer X; waitfor "$LDIR/X.stalled" 200
+    rm() {
+        if [[ "$*" == *"$lock"* && ! -e "$LDIR/X.go" ]]; then
+            : > "$LDIR/X.go"; waitfor "$LDIR/X.done"
+        fi
+        command rm "$@"
+    }
+fi
+if _instance_lock_acquire x; then echo "A took it" >> "$LDIR/events"; else echo "A stood down" >> "$LDIR/events"; fi
+if [[ "$MODE" == reuse ]]; then waitfor "$LDIR/B.done" 240; else waitfor "$LDIR/X.done" 240; fi
+cat "$LDIR/events"
+echo "$BASHPID" > "$LDIR/A.pid"
+h="$(sed -n 's/ took it$//p' "$LDIR/events" | head -1)"
+echo "holder pid: $(command cat "$LDIR/$h.pid" 2>/dev/null)"
+echo "owner now: $(command cat "$lock/owner" 2>/dev/null)"
+for p in H B X; do : > "$LDIR/$p.exit"; done
+wait
+STRADDLE
+straddle() { rm -rf "$T/st"; mkdir -p "$T/st"; FNS="$fns" LDIR="$T/st" MODE="$1" PEER="$T/straddle-peer.sh" bash "$T/straddle.sh" 2>&1; }
+for mode in reuse stall; do
+    out="$(straddle "$mode")"
+    chk "$mode: one launch takes the lock, never two" '[[ "$(grep -c " took it" <<<"$out")" -eq 1 ]]'
+    chk "  and the lock is that launch's"          '[[ "$(sed -n "s/^owner now: //p" <<<"$out")" == "$(sed -n "s/^holder pid: //p" <<<"$out")" ]] && grep -q "^owner now: [0-9]" <<<"$out"'
 done
 
 hdr "207 — many launches at a lock whose holders keep dying"
