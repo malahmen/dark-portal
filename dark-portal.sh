@@ -1119,21 +1119,25 @@ _reap_window_claims() {
 # on a healthy neighbour. Breaking goes through _lock_break, which removes
 # the lock only if it is still the one this launch looked at, so of waiters
 # that saw the same stale lock only one removes it, and none removes a fresh
-# lock a third launch took in between.
+# lock a third launch took in between. The 90s are timed per holder: 'held'
+# restarts whenever the owner changes, so a launch that loses the race after
+# a forced break (or sees the lock change hands any other way) gives the new
+# holder its own 90s instead of breaking its fresh lock at once (Kamino 224).
 _launch_lock_acquire() {
-    local waited=0 owner
+    local waited=0 held=0 owner holder=""
     until mkdir "$LAUNCH_LOCK_DIR" 2>/dev/null; do
         owner="$(cat "${LAUNCH_LOCK_DIR}/owner" 2>/dev/null || true)"
         if [[ -n "$owner" ]] && ! kill -0 "$owner" 2>/dev/null; then
             warn "Breaking stale launch lock (owner pid ${owner} is gone)."
             _lock_break "$LAUNCH_LOCK_DIR" "$owner" || true; continue
         fi
-        if (( waited >= 90 )); then
+        [[ "$owner" == "$holder" ]] || { holder="$owner"; held=0; }
+        if (( held >= 90 )); then
             warn "Launch lock held for over 90s by pid '${owner}' — breaking it."
             _lock_break "$LAUNCH_LOCK_DIR" "$owner" --force || true; continue
         fi
         (( waited == 0 )) && info "Waiting for a previous launch to claim its window first..."
-        sleep 1; waited=$((waited + 1))
+        sleep 1; waited=$((waited + 1)); held=$((held + 1))
     done
     echo "$BASHPID" > "${LAUNCH_LOCK_DIR}/owner"
 }
