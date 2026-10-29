@@ -1045,10 +1045,11 @@ _lock_is_stale() {
 # _lock_break DIR OWNER [--force] — removes the lock DIR, but only if it is
 # still OWNER's and (without --force) still stale. The look and the rm happen
 # holding DIR.break (flock(1); the kernel drops it if this dies), and every
-# launch that removes a lock it does not own holds it too: so of launches that
-# saw the same stale lock only the first removes it, and none can remove a
-# fresh lock another launch took after its look. Nothing is moved aside and
-# put back (Kamino items 107, 207). Returns 1 if it left DIR alone.
+# launch that removes a lock it does not own holds it too, as does every
+# _lock_take while it creates one: so of launches that saw the same stale
+# lock only the first removes it, and none can remove a fresh lock another
+# launch took after its look. Nothing is moved aside and put back (Kamino
+# items 107, 207). Returns 1 if it left DIR alone.
 _lock_break() {
     command -v flock >/dev/null || error_exit "flock (util-linux) is needed to break a stale lock: ${1}"
     (
@@ -1059,16 +1060,38 @@ _lock_break() {
     ) 9>"${1}.break"
 }
 
+# _lock_take DIR PID — creates the lock DIR (mkdir: atomic) and writes PID
+# to DIR/owner, both holding DIR.break like _lock_break. So a breaker, which
+# looks and removes holding it too, never sees a lock whose owner is still
+# being written, and no new lock can appear at DIR between its look and its
+# rm. Taken outside it, a breaker that looked at a stale lock could remove a
+# lock taken after its look, and two launches held it at once: when a launch
+# that got the dead owner's PID took and released the lock between the look
+# and the rm, or when a launch stalled a minute between its mkdir and its PID
+# (Kamino 207). Returns 1 if DIR exists. Without flock nothing can break a
+# lock, so the plain mkdir is enough there.
+_lock_take() {
+    if ! command -v flock >/dev/null; then
+        mkdir "$1" 2>/dev/null || return 1
+        echo "$2" > "${1}/owner"
+        return 0
+    fi
+    (
+        flock -w 10 9 || exit 1
+        mkdir "$1" 2>/dev/null || exit 1
+        echo "$2" > "${1}/owner"
+    ) 9>"${1}.break"
+}
+
 _instance_lock_acquire() {
     local lock owner
     lock="$(_instance_dir "$1")/launch.lock"
-    if ! mkdir "$lock" 2>/dev/null; then
+    if ! _lock_take "$lock" "$BASHPID"; then
         owner="$(cat "${lock}/owner" 2>/dev/null || true)"
         _lock_is_stale "$lock" "$owner" || return 1
         _lock_break "$lock" "$owner" || true
-        mkdir "$lock" 2>/dev/null || return 1
+        _lock_take "$lock" "$BASHPID" || return 1
     fi
-    echo "$BASHPID" > "${lock}/owner"
     _INSTANCE_LOCK="$lock"
     trap '_instance_lock_release' EXIT
 }
