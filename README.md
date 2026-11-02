@@ -187,8 +187,9 @@ absolute path (one already stored relative, by hand, is refused by
 - A launch lock left by a dead launch is broken by one launch only, and never
   one a live launch has just taken: breaking re-checks the lock while holding
   a `flock` on `launch.lock.break` beside it, and only then removes it. A
-  launch takes the instance lock (and writes its PID into it) holding that
-  `flock` too, so no new lock can appear between the re-check and the removal.
+  launch takes the instance lock and the launch lock (and writes its PID into
+  each) holding that `flock` too, so no new lock can appear between the
+  re-check and the removal.
 
 ## Testing
 
