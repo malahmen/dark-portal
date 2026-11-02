@@ -31,7 +31,12 @@ games() { pgrep -f "${INST}/$1/client/WoW.exe" | wc -l; }   # running "games" of
 
 # A client to provision from, and the settings 'configure' wants.
 SRC="$T/client"; mkdir -p "$SRC/Data" "$SRC/WTF"
-printf '#!/usr/bin/env bash\nwhile :; do sleep 1; done\n' > "$SRC/WoW.exe"; chmod +x "$SRC/WoW.exe"
+# The "game" waits on a FIFO nothing writes to, and forks nothing: a 'sleep'
+# child is, until its exec, a copy of the game with the game's argv, and
+# games() counted it as a second game when it looked at that moment.
+mkfifo "$T/hang"
+printf '#!/usr/bin/env bash\nexec 3<>"%s"\nwhile :; do read -r -t 3600 -u 3 _; done\n' "$T/hang" > "$SRC/WoW.exe"
+chmod +x "$SRC/WoW.exe"
 run set CLIENT_SOURCE_DIR "$SRC" >/dev/null
 run set BOTTLES_RUNNER soda-test >/dev/null
 run set DEFAULT_REALM_ADDRESS 192.168.3.52 >/dev/null
@@ -129,10 +134,15 @@ hdr "36 — two launches of one instance at once"
 run add-instance --name box2 >/dev/null
 run launch box2 > "$T/l1" 2>&1 & p1=$!
 run launch box2 > "$T/l2" 2>&1 & p2=$!
+# Both launches have returned, and the one that started the game only after
+# seeing it run: nothing more to wait for. (grep reads both files itself:
+# 'cat l1 l2 | grep -q' failed under pipefail when grep matched in l1 and
+# quit before cat wrote l2 - cat died of SIGPIPE.)
 wait "$p1" "$p2"
-sleep 1
 chk "only one game started"                    '[[ "$(games box2)" -eq 1 ]]'
-chk "  the other launch said why"              'cat "$T/l1" "$T/l2" | grep -qE "being launched by another process|already appears to be running"'
+chk "  the other launch said why"              'grep -qE "being launched by another process|already appears to be running" "$T/l1" "$T/l2"'
+out="$(run launch box2)"; rc=$?
+chk "a launch while it runs starts nothing"    '[[ $rc -eq 0 && "$(games box2)" -eq 1 ]] && grep -q "already appears to be running" <<<"$out"'
 run stop box2 >/dev/null
 
 # ---------------------------------------------------------------- 38
@@ -142,21 +152,30 @@ chk "declared local in _title_find_window"     'grep -qE "^ +local .*\bexe_re\b"
 
 # ---------------------------------------------------------------- 107
 hdr "107 — two add-instance runs for one name"
-# Both must pass the "already exists" check before either claims the folder:
-# a mkdir on PATH pauses one second for this instance's folder only. A then
-# makes the bottle; B, 0.3s behind, is told its bottle creation fails.
+# Both must pass the "already exists" check before either claims the folder,
+# and A must claim it first: a mkdir on PATH, for this instance's folder
+# only, holds A there until B has got there too, and B until A has made the
+# folder (files in $T/r107; no delays, so a slow start cannot reorder them).
+# A then makes the bottle; B is told its bottle creation fails.
 REAL_MKDIR="$(command -v mkdir)"
-mkdir -p "$T/slow"
+mkdir -p "$T/slow" "$T/r107"
 cat > "$T/slow/mkdir" <<SLOW
 #!/usr/bin/env bash
-for a in "\$@"; do [[ "\$a" == "$INST/race" ]] && sleep 1; done
+waitfor() { local i; for i in \$(seq 600); do [[ -e "\$1" ]] && return 0; sleep 0.05; done; echo "mkdir hook: no \$1" >&2; }
+for a in "\$@"; do
+    [[ "\$a" == "$INST/race" ]] || continue
+    : > "$T/r107/\$ROLE107.at-mkdir"
+    if [[ "\$ROLE107" == A ]]; then waitfor "$T/r107/B.at-mkdir"; else waitfor "$T/r107/A.made"; fi
+    "$REAL_MKDIR" "\$@"; rc=\$?
+    [[ "\$ROLE107" == A ]] && : > "$T/r107/A.made"
+    exit "\$rc"
+done
 exec "$REAL_MKDIR" "\$@"
 SLOW
 chmod +x "$T/slow/mkdir"
 BOTTLE_RACE="$HOME/.var/app/com.usebottles.bottles/data/bottles/bottles/dp-race"
-( PATH="$T/slow:$PATH" run add-instance --name race > "$T/race-a.out" ) &
-sleep 0.3
-outb="$(PATH="$T/slow:$PATH" STUB_BOTTLE_FAIL=1 run add-instance --name race)"; rcb=$?
+( PATH="$T/slow:$PATH" ROLE107=A run add-instance --name race > "$T/race-a.out" ) &
+outb="$(PATH="$T/slow:$PATH" ROLE107=B STUB_BOTTLE_FAIL=1 run add-instance --name race)"; rcb=$?
 wait
 chk "the second run is refused: already exists" '[[ $rcb -ne 0 ]] && grep -q "already exists" <<<"$outb"'
 chk "  and the first run's instance survives"   '[[ -d "$INST/race/client" ]]'
@@ -411,6 +430,91 @@ for mode in reuse stall; do
     chk "$mode: one launch takes the lock, never two" '[[ "$(grep -c " took it" <<<"$out")" -eq 1 ]]'
     chk "  and the lock is that launch's"          '[[ "$(sed -n "s/^owner now: //p" <<<"$out")" == "$(sed -n "s/^holder pid: //p" <<<"$out")" ]] && grep -q "^owner now: [0-9]" <<<"$out"'
 done
+
+hdr "228 — the launch lock: a forced break removes only the lock it looked at"
+# X is wedged (suspend, SIGSTOP) while taking the launch lock: it stops at
+# writing its PID until A's forced break is about to rm, or for ~3s. A waits
+# on a fake clock (sleep advances it 1s, nothing really waits); after 90s
+# with the same owner it force-breaks. Just before A's rm, X writes its PID
+# and returns holding the lock. A's rm must remove a lock whose owner A
+# looked at: on the old engine X's PID went in after a bare mkdir, outside
+# the break lock, so A force-broke an ownerless lock and its rm took X's lock
+# the moment X got it.
+cat > "$T/wedged-peer.sh" <<'PEER'
+eval "$FNS"
+error_exit() { builtin echo "error: $*"; exit 1; }
+warn() { :; }; info() { :; }
+waitfor() { local i; for i in $(seq "${2:-40}"); do [[ -e "$1" ]] && return 0; sleep 0.05; done; return 1; }
+LAUNCH_LOCK_DIR="$LDIR/launch.lock"
+echo() {
+    if [[ ! -e "$LDIR/X.stalled" ]]; then : > "$LDIR/X.stalled"; waitfor "$LDIR/X.go" 60; fi
+    builtin echo "$@"
+}
+_launch_lock_acquire
+builtin echo "X took it" >> "$LDIR/events"; builtin echo "$BASHPID" > "$LDIR/X.pid"; : > "$LDIR/X.done"
+waitfor "$LDIR/X.exit" 400
+exit 0
+PEER
+cat > "$T/wedged.sh" <<'WEDGED'
+set -u
+eval "$FNS"
+error_exit() { echo "error: $*"; exit 1; }
+warn() { :; }; info() { :; }
+waitfor() { local i; for i in $(seq "${2:-40}"); do [[ -e "$1" ]] && return 0; command sleep 0.05; done; return 1; }
+LAUNCH_LOCK_DIR="$LDIR/launch.lock"
+( bash "$PEER" ) &
+waitfor "$LDIR/X.stalled" 200
+now=0 looked=""
+sleep() { now=$((now + 1)); (( now <= 400 )) || { echo "gave up at ${now}s"; exit 1; }; }
+eval "orig_$(declare -f _lock_break)"
+_lock_break() { [[ "${3:-}" == --force ]] && looked="$2"; orig__lock_break "$@"; }
+rm() {
+    if [[ "$*" == *"$LAUNCH_LOCK_DIR"* && -n "${looked+x}" && ! -e "$LDIR/X.go" ]]; then
+        : > "$LDIR/X.go"; waitfor "$LDIR/X.done" 200
+        echo "A at ${now}s removes the lock of '$(command cat "$LAUNCH_LOCK_DIR/owner" 2>/dev/null)', looked at '$looked'"
+    fi
+    command rm "$@"
+}
+_launch_lock_acquire && echo "A took it at ${now}s"
+waitfor "$LDIR/X.done" 200
+echo "X pid: $(command cat "$LDIR/X.pid" 2>/dev/null)"
+: > "$LDIR/X.exit"; wait
+WEDGED
+rm -rf "$T/wl"; mkdir -p "$T/wl"
+out="$(FNS="$fns" LDIR="$T/wl" PEER="$T/wedged-peer.sh" bash "$T/wedged.sh" 2>&1)"
+chk "A force-breaks X's lock after its 90s (control)" 'grep -Eq "^A at 9[01]s removes the lock of .[0-9]+." <<<"$out" && grep -q "A took it" <<<"$out"'
+chk "  and the lock it removed is the one it looked at" 'grep -Eq "^A at [0-9]+s removes the lock of .([0-9]+)., looked at .\1.$" <<<"$out" && grep -q "of .$(sed -n "s/^X pid: //p" <<<"$out")." <<<"$out"'
+
+hdr "228 — the break lock busy: a take or a break does nothing"
+# Another process holds <lock>.break throughout (a launch wedged in its
+# critical section). flock waits 0.2s here instead of the engine's 10s: the
+# take must fail without creating the lock, and the break must fail and keep
+# the lock, rather than go ahead without the break lock.
+cat > "$T/busy.sh" <<'BUSY'
+set -u
+eval "$FNS"
+error_exit() { echo "error: $*"; exit 1; }
+flock() { if [[ "$1" == -w ]]; then shift 2; command flock -w 0.2 "$@"; else command flock "$@"; fi; }
+waitfor() { local i; for i in $(seq 200); do [[ -e "$1" ]] && return 0; sleep 0.05; done; return 1; }
+lock="$LDIR/launch.lock"
+( exec 8>"$lock.break"; command flock 8; : > "$LDIR/busy"; waitfor "$LDIR/free" ) &
+waitfor "$LDIR/busy"
+if _lock_take "$lock" "$$"; then echo "take: returned 0"; else echo "take: failed"; fi
+[[ -e "$lock" ]] && echo "take: the lock exists"
+mkdir "$lock"; echo 2147483646 > "$lock/owner"
+if _lock_break "$lock" 2147483646; then echo "break: returned 0"; else echo "break: failed"; fi
+[[ -e "$lock" ]] || echo "break: the lock is gone"
+: > "$LDIR/free"; wait
+rm -rf "$lock"
+_lock_take "$lock" "$$" && echo "free: took it, owner $(cat "$lock/owner")"
+BUSY
+rm -rf "$T/busy"; mkdir -p "$T/busy"
+out="$(FNS="$fns" LDIR="$T/busy" bash "$T/busy.sh" 2>&1)"
+chk "a take with the break lock busy fails"    'grep -q "^take: failed" <<<"$out"'
+chk "  and creates no lock"                    '! grep -q "take: the lock exists" <<<"$out"'
+chk "a break with the break lock busy fails"   'grep -q "^break: failed" <<<"$out"'
+chk "  and keeps the lock"                     '! grep -q "break: the lock is gone" <<<"$out"'
+chk "  once it is free, a take works (control)" 'grep -Eq "^free: took it, owner [0-9]+$" <<<"$out"'
 
 hdr "207 — many launches at a lock whose holders keep dying"
 # Each attempt takes the lock, marks itself inside, and half the time exits

@@ -1068,8 +1068,10 @@ _lock_break() {
 # lock taken after its look, and two launches held it at once: when a launch
 # that got the dead owner's PID took and released the lock between the look
 # and the rm, or when a launch stalled a minute between its mkdir and its PID
-# (Kamino 207). Returns 1 if DIR exists. Without flock nothing can break a
-# lock, so the plain mkdir is enough there.
+# (Kamino 207). Both the instance and the launch lock are taken here (228).
+# Returns 1 if DIR exists, and also if DIR.break stays busy past the 10s
+# wait - then nothing is created. Without flock nothing can break a lock, so
+# the plain mkdir is enough there.
 _lock_take() {
     if ! command -v flock >/dev/null; then
         mkdir "$1" 2>/dev/null || return 1
@@ -1133,22 +1135,27 @@ _reap_window_claims() {
     done
 }
 
-# _launch_lock_acquire — takes LAUNCH_LOCK_DIR (mkdir: atomic), first waiting
-# for a sibling launch to finish its snapshot-to-claim phase. The holder's
-# PID lives in 'owner'; a dead owner (a launch killed or Ctrl-C'd mid-search)
-# is a stale lock and is broken at once. A live holder's phase is bounded to
-# ~10s of start-up polling plus ~30s of window hunting, so waiting well past
-# that and then breaking the lock only ever fires on something wedged, never
-# on a healthy neighbour. Breaking goes through _lock_break, which removes
+# _launch_lock_acquire — takes LAUNCH_LOCK_DIR (mkdir: atomic, via
+# _lock_take), first waiting for a sibling launch to finish its
+# snapshot-to-claim phase. The holder's PID lives in 'owner'; a dead owner
+# (a launch killed or Ctrl-C'd mid-search) is a stale lock and is broken at
+# once. A live holder's phase is bounded to ~10s of start-up polling plus
+# ~30s of window hunting, so waiting well past that and then breaking the
+# lock only ever fires on something wedged, never on a healthy neighbour. Breaking goes through _lock_break, which removes
 # the lock only if it is still the one this launch looked at, so of waiters
 # that saw the same stale lock only one removes it, and none removes a fresh
 # lock a third launch took in between. The 90s are timed per holder: 'held'
 # restarts whenever the owner changes, so a launch that loses the race after
 # a forced break (or sees the lock change hands any other way) gives the new
 # holder its own 90s instead of breaking its fresh lock at once (Kamino 224).
+# The lock is created and its owner written under the break lock, as for the
+# instance lock: with the owner written after a bare mkdir, a launch stalled
+# between the two (over 90s: suspend, SIGSTOP) let a waiter force-break the
+# ownerless lock, the owner landed just before the waiter's rm, and the rm
+# took a lock the waiter never looked at (Kamino 228).
 _launch_lock_acquire() {
     local waited=0 held=0 owner holder=""
-    until mkdir "$LAUNCH_LOCK_DIR" 2>/dev/null; do
+    until _lock_take "$LAUNCH_LOCK_DIR" "$BASHPID"; do
         owner="$(cat "${LAUNCH_LOCK_DIR}/owner" 2>/dev/null || true)"
         if [[ -n "$owner" ]] && ! kill -0 "$owner" 2>/dev/null; then
             warn "Breaking stale launch lock (owner pid ${owner} is gone)."
@@ -1162,7 +1169,6 @@ _launch_lock_acquire() {
         (( waited == 0 )) && info "Waiting for a previous launch to claim its window first..."
         sleep 1; waited=$((waited + 1)); held=$((held + 1))
     done
-    echo "$BASHPID" > "${LAUNCH_LOCK_DIR}/owner"
 }
 
 # _launch_lock_release — drops the launch lock, but only if it's still this
